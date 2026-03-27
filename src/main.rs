@@ -105,6 +105,8 @@ enum Command {
     },
     /// Get semantic tokens for a file
     SemanticTokens { file: String },
+    /// List capabilities reported by the server
+    Capabilities,
     /// Get inlay hints for a file or line range
     InlayHints {
         file: String,
@@ -141,9 +143,9 @@ fn main() {
     let mut session = LspSession::new(transport, cli.verbose);
 
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
-        session.initialize(&root)?;
+        let init_resp = session.initialize(&root)?;
 
-        let needs_open = !matches!(cli.command, Command::WorkspaceSymbols { .. });
+        let needs_open = !matches!(cli.command, Command::WorkspaceSymbols { .. } | Command::Capabilities);
 
         if needs_open {
             let file = match &cli.command {
@@ -158,6 +160,7 @@ fn main() {
                 | Command::Rename { file, .. }
                 | Command::SemanticTokens { file }
                 | Command::InlayHints { file, .. } => file.clone(),
+                Command::Capabilities => unreachable!(),
                 Command::WorkspaceSymbols { .. } => unreachable!(),
             };
             let abs = abs_path(&file);
@@ -198,6 +201,10 @@ fn main() {
                 let abs = abs_path(file);
                 let resp = session.completion(&abs, line - 1, col - 1)?;
                 if cli.json { print_json(&resp) } else { println!("{}", format_completion(&resp)) }
+            }
+            Command::Capabilities => {
+                let caps = &init_resp["result"]["capabilities"];
+                if cli.json { print_json(&init_resp) } else { println!("{}", format_capabilities(caps)) }
             }
             Command::SignatureHelp { file, line, col } => {
                 let abs = abs_path(file);

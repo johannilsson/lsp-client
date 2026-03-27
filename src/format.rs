@@ -22,6 +22,99 @@ fn symbol_kind(kind: u64) -> &'static str {
     }
 }
 
+pub fn format_capabilities(caps: &Value) -> String {
+    let mut lines = Vec::new();
+
+    // Text sync
+    if let Some(sync) = caps.get("textDocumentSync") {
+        let kind = match sync.as_u64().or_else(|| sync.get("change").and_then(|v| v.as_u64())) {
+            Some(0) => "none",
+            Some(1) => "full",
+            Some(2) => "incremental",
+            _ => "unknown",
+        };
+        lines.push(format!("textDocumentSync       : {kind}"));
+    }
+
+    let bool_cap = |key: &str| caps.get(key).map(|v| !v.is_null() && v != &Value::Bool(false)).unwrap_or(false);
+
+    if bool_cap("hoverProvider") {
+        lines.push("hover                  : yes".into());
+    }
+    if let Some(c) = caps.get("completionProvider").filter(|v| !v.is_null()) {
+        let triggers = c.get("triggerCharacters").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let resolve = c.get("resolveProvider").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut detail = Vec::new();
+        if !triggers.is_empty() { detail.push(format!("trigger: \"{triggers}\"")); }
+        if resolve { detail.push("resolve".into()); }
+        let detail_str = if detail.is_empty() { String::new() } else { format!(" ({})", detail.join(", ")) };
+        lines.push(format!("completion             : yes{detail_str}"));
+    }
+    if let Some(c) = caps.get("signatureHelpProvider").filter(|v| !v.is_null()) {
+        let triggers = c.get("triggerCharacters").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let detail_str = if triggers.is_empty() { String::new() } else { format!(" (trigger: \"{triggers}\")")};
+        lines.push(format!("signatureHelp          : yes{detail_str}"));
+    }
+    if bool_cap("definitionProvider") {
+        lines.push("definition             : yes".into());
+    }
+    if bool_cap("referencesProvider") {
+        lines.push("references             : yes".into());
+    }
+    if bool_cap("documentSymbolProvider") {
+        lines.push("documentSymbol         : yes".into());
+    }
+    if bool_cap("workspaceSymbolProvider") {
+        lines.push("workspaceSymbol        : yes".into());
+    }
+    if let Some(c) = caps.get("codeActionProvider").filter(|v| !v.is_null()) {
+        let kinds = c.get("codeActionKinds").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let detail_str = if kinds.is_empty() { String::new() } else { format!(" ({kinds})") };
+        lines.push(format!("codeAction             : yes{detail_str}"));
+    }
+    if bool_cap("documentFormattingProvider") {
+        lines.push("formatting             : yes".into());
+    }
+    if bool_cap("renameProvider") {
+        lines.push("rename                 : yes".into());
+    }
+    if let Some(c) = caps.get("semanticTokensProvider").filter(|v| !v.is_null()) {
+        let full = c.get("full").map(|v| !v.is_null() && v != &Value::Bool(false)).unwrap_or(false);
+        let range = c.get("range").map(|v| !v.is_null() && v != &Value::Bool(false)).unwrap_or(false);
+        let mut modes = Vec::new();
+        if full { modes.push("full"); }
+        if range { modes.push("range"); }
+        let modes_str = if modes.is_empty() { String::new() } else { format!(" ({})", modes.join(", ")) };
+        lines.push(format!("semanticTokens         : yes{modes_str}"));
+    }
+    if bool_cap("inlayHintProvider") {
+        lines.push("inlayHints             : yes".into());
+    }
+    if let Some(c) = caps.get("diagnosticProvider").filter(|v| !v.is_null()) {
+        let inter = c.get("interFileDependencies").and_then(|v| v.as_bool()).unwrap_or(false);
+        let workspace = c.get("workspaceDiagnostics").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut detail = Vec::new();
+        if inter { detail.push("inter-file"); }
+        if workspace { detail.push("workspace"); }
+        let detail_str = if detail.is_empty() { String::new() } else { format!(" ({})", detail.join(", ")) };
+        lines.push(format!("diagnostics            : yes{detail_str}"));
+    }
+    if let Some(c) = caps.get("executeCommandProvider").filter(|v| !v.is_null()) {
+        let cmds = c.get("commands").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        lines.push(format!("executeCommand         : {cmds}"));
+    }
+
+    if lines.is_empty() { "No capabilities reported.".into() } else { lines.join("\n") }
+}
+
 pub fn format_hover(resp: &Value) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No hover information found.".into();
