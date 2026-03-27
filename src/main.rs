@@ -84,6 +84,37 @@ enum Command {
         line: u32,
         col: u32,
     },
+    /// Get function signature help at a position
+    SignatureHelp {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// Get available code actions at a position (quick fixes, refactors)
+    CodeAction {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// Rename a symbol across the workspace
+    Rename {
+        file: String,
+        line: u32,
+        col: u32,
+        new_name: String,
+    },
+    /// Get semantic tokens for a file
+    SemanticTokens { file: String },
+    /// Get inlay hints for a file or line range
+    InlayHints {
+        file: String,
+        /// First line to include hints for (1-based, default: 1)
+        #[arg(long, default_value = "1")]
+        start_line: u32,
+        /// Last line to include hints for (1-based, default: end of file)
+        #[arg(long)]
+        end_line: Option<u32>,
+    },
 }
 
 fn main() {
@@ -121,7 +152,12 @@ fn main() {
                 | Command::References { file, .. }
                 | Command::Symbols { file }
                 | Command::Diagnostics { file }
-                | Command::Completion { file, .. } => file.clone(),
+                | Command::Completion { file, .. }
+                | Command::SignatureHelp { file, .. }
+                | Command::CodeAction { file, .. }
+                | Command::Rename { file, .. }
+                | Command::SemanticTokens { file }
+                | Command::InlayHints { file, .. } => file.clone(),
                 Command::WorkspaceSymbols { .. } => unreachable!(),
             };
             let abs = abs_path(&file);
@@ -162,6 +198,36 @@ fn main() {
                 let abs = abs_path(file);
                 let resp = session.completion(&abs, line - 1, col - 1)?;
                 if cli.json { print_json(&resp) } else { println!("{}", format_completion(&resp)) }
+            }
+            Command::SignatureHelp { file, line, col } => {
+                let abs = abs_path(file);
+                let resp = session.signature_help(&abs, line - 1, col - 1)?;
+                if cli.json { print_json(&resp) } else { println!("{}", format_signature_help(&resp)) }
+            }
+            Command::CodeAction { file, line, col } => {
+                let abs = abs_path(file);
+                let resp = session.code_action(&abs, line - 1, col - 1)?;
+                if cli.json { print_json(&resp) } else { println!("{}", format_code_actions(&resp)) }
+            }
+            Command::Rename { file, line, col, new_name } => {
+                let abs = abs_path(file);
+                let resp = session.rename(&abs, line - 1, col - 1, new_name)?;
+                if cli.json { print_json(&resp) } else { println!("{}", format_rename(&resp)) }
+            }
+            Command::SemanticTokens { file } => {
+                let abs = abs_path(file);
+                let resp = session.semantic_tokens(&abs)?;
+                if cli.json { print_json(&resp) } else { println!("{}", format_semantic_tokens(&resp)) }
+            }
+            Command::InlayHints { file, start_line, end_line } => {
+                let abs = abs_path(file);
+                let end = end_line.unwrap_or_else(|| {
+                    std::fs::read_to_string(&abs)
+                        .map(|s| s.lines().count() as u32)
+                        .unwrap_or(u32::MAX / 2)
+                });
+                let resp = session.inlay_hints(&abs, start_line - 1, end)?;
+                if cli.json { print_json(&resp) } else { println!("{}", format_inlay_hints(&resp)) }
             }
         }
 

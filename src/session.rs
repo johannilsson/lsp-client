@@ -94,6 +94,20 @@ impl LspSession {
                     "documentSymbol": {},
                     "diagnostic": {},
                     "formatting": {},
+                    "signatureHelp": {
+                        "signatureInformation": {"parameterInformation": {"labelOffsetSupport": true}},
+                    },
+                    "codeAction": {
+                        "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["quickfix", "source.organizeImports"]}},
+                    },
+                    "rename": {},
+                    "semanticTokens": {
+                        "requests": {"full": true, "range": true},
+                        "tokenTypes": [],
+                        "tokenModifiers": [],
+                        "formats": ["relative"],
+                    },
+                    "inlayHint": {},
                 },
                 "workspace": {
                     "symbol": {},
@@ -160,6 +174,47 @@ impl LspSession {
         self.request("textDocument/completion", json!({
             "textDocument": {"uri": file_uri(file_path)},
             "position": {"line": line, "character": col},
+        }))
+    }
+
+    pub fn signature_help(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
+        self.request("textDocument/signatureHelp", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "position": {"line": line, "character": col},
+        }))
+    }
+
+    pub fn code_action(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
+        // Use a zero-width range at the given position
+        let pos = json!({"line": line, "character": col});
+        self.request("textDocument/codeAction", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "range": {"start": pos, "end": pos},
+            "context": {"diagnostics": []},
+        }))
+    }
+
+    pub fn rename(&mut self, file_path: &str, line: u32, col: u32, new_name: &str) -> Result<Value> {
+        self.request("textDocument/rename", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "position": {"line": line, "character": col},
+            "newName": new_name,
+        }))
+    }
+
+    pub fn semantic_tokens(&mut self, file_path: &str) -> Result<Value> {
+        self.request("textDocument/semanticTokens/full", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+        }))
+    }
+
+    pub fn inlay_hints(&mut self, file_path: &str, start_line: u32, end_line: u32) -> Result<Value> {
+        self.request("textDocument/inlayHint", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "range": {
+                "start": {"line": start_line, "character": 0},
+                "end":   {"line": end_line,   "character": 0},
+            },
         }))
     }
 
