@@ -63,6 +63,10 @@ By default the client connects to a running `kotlin-lsp` server over TCP (`--mul
 
 Use `--stdio` to skip the shared server and spawn a fresh process per call — simpler but slower due to JVM startup time.
 
+## Known limitations
+
+**Android projects:** kotlin-lsp currently only supports JVM-only Kotlin Gradle projects out of the box. `workspace-symbols` returns empty results for Android projects. File-level commands (`symbols`, `hover`, `diagnostics`, etc.) work fine. Tracking issues: [#26](https://github.com/Kotlin/kotlin-lsp/issues/26), [#88](https://github.com/Kotlin/kotlin-lsp/issues/88).
+
 ## Alternatives
 
 - [valentjn/lsp-cli](https://github.com/valentjn/lsp-cli) — Java/Kotlin, broad LSP command coverage

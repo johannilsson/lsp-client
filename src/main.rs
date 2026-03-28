@@ -38,6 +38,10 @@ struct Cli {
     #[arg(long, global = true)]
     stdio: bool,
 
+    /// Do not pass --stdio to the server process (e.g. rust-analyzer uses stdio by default)
+    #[arg(long, global = true)]
+    no_server_stdio_flag: bool,
+
     /// Output raw LSP result as JSON
     #[arg(long, global = true)]
     json: bool,
@@ -75,7 +79,15 @@ enum Command {
     /// List all symbols in a file
     Symbols { file: String },
     /// Search symbols across the workspace
-    WorkspaceSymbols { query: String },
+    WorkspaceSymbols {
+        query: String,
+        /// Open this file first to trigger workspace indexing
+        #[arg(long)]
+        file: Option<String>,
+        /// Retry up to N times if result is empty (waits 1s between attempts)
+        #[arg(long, default_value = "10")]
+        retries: u32,
+    },
     /// Get errors and warnings for a file
     Diagnostics { file: String },
     /// Get completions at a position
@@ -127,7 +139,8 @@ fn main() {
         .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into_owned());
 
     let transport = if cli.stdio {
-        Transport::stdio(&cli.server, &[])
+        let args: &[&str] = if cli.no_server_stdio_flag { &[] } else { &["--stdio"] };
+        Transport::stdio(&cli.server, args)
     } else {
         Transport::tcp_with_autostart(&cli.host, cli.port, &cli.server, cli.verbose)
     };
@@ -145,7 +158,7 @@ fn main() {
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         let init_resp = session.initialize(&root)?;
 
-        let needs_open = !matches!(cli.command, Command::WorkspaceSymbols { .. } | Command::Capabilities);
+        let needs_open = !matches!(cli.command, Command::WorkspaceSymbols { file: None, .. } | Command::Capabilities);
 
         if needs_open {
             let file = match &cli.command {
@@ -161,7 +174,8 @@ fn main() {
                 | Command::SemanticTokens { file }
                 | Command::InlayHints { file, .. } => file.clone(),
                 Command::Capabilities => unreachable!(),
-                Command::WorkspaceSymbols { .. } => unreachable!(),
+                Command::WorkspaceSymbols { file: Some(f), .. } => f.clone(),
+                Command::WorkspaceSymbols { file: None, .. } => unreachable!(),
             };
             let abs = abs_path(&file);
             session.did_open(&abs, &cli.language_id)?;
@@ -188,8 +202,16 @@ fn main() {
                 let resp = session.document_symbols(&abs)?;
                 if cli.json { print_json(&resp) } else { println!("{}", format_symbols(&resp)) }
             }
-            Command::WorkspaceSymbols { query } => {
-                let resp = session.workspace_symbols(query)?;
+            Command::WorkspaceSymbols { query, retries, .. } => {
+                let mut resp = session.workspace_symbols(query)?;
+                // Retry if empty — server may still be indexing
+                for _ in 0..*retries {
+                    let is_empty = resp["result"].as_array().map(|a| a.is_empty()).unwrap_or(true);
+                    if !is_empty { break; }
+                    if cli.verbose { eprintln!("[DEBUG] empty result, retrying..."); }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    resp = session.workspace_symbols(query)?;
+                }
                 if cli.json { print_json(&resp) } else { println!("{}", format_workspace_symbols(&resp)) }
             }
             Command::Diagnostics { file } => {

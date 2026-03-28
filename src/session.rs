@@ -1,6 +1,8 @@
 use crate::transport::{Result, Transport};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub struct LspSession {
     transport: Transport,
@@ -129,7 +131,87 @@ impl LspSession {
                 "version": 1,
                 "text": text,
             }
-        }))
+        }))?;
+        // Wait for server to finish indexing before we query.
+        // Only possible in TCP mode — stdio transport doesn't support read timeouts.
+        if self.transport.supports_timeout() {
+            self.wait_for_idle(Duration::from_secs(60));
+        }
+        Ok(())
+    }
+
+    /// Read and discard incoming messages until the server goes quiet and all
+    /// $/progress tokens have completed, or until `max_wait` elapses.
+    ///
+    /// This is necessary because servers like kotlin-lsp index asynchronously
+    /// after didOpen and return empty results if queried before indexing finishes.
+    fn wait_for_idle(&mut self, max_wait: Duration) {
+        let mut pending: HashSet<serde_json::Value> = HashSet::new();
+        let deadline = Instant::now() + max_wait;
+
+        // Use a short read timeout so we can detect when the server goes quiet.
+        self.transport.set_read_timeout(Some(Duration::from_millis(500)));
+
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            match self.transport.reader.try_read_message() {
+                Ok(Some(msg)) => {
+                    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Ack any server-initiated requests (e.g. window/workDoneProgress/create)
+                    if method == "window/workDoneProgress/create" {
+                        if let Some(token) = msg["params"].get("token") {
+                            pending.insert(token.clone());
+                        }
+                        if let Some(id) = msg.get("id") {
+                            let ack = json!({"jsonrpc":"2.0","id":id,"result":null});
+                            let _ = self.transport.send_raw(&ack.to_string());
+                        }
+                        if self.verbose {
+                            eprintln!("[DEBUG] <<< progress token registered");
+                        }
+                        continue;
+                    }
+
+                    // Track $/progress begin/end
+                    if method == "$/progress" {
+                        let token = &msg["params"]["token"];
+                        let kind = msg["params"]["value"]["kind"].as_str().unwrap_or("");
+                        match kind {
+                            "begin" => { pending.insert(token.clone()); }
+                            "end" => { pending.remove(token); }
+                            _ => {}
+                        }
+                        if self.verbose {
+                            let title = msg["params"]["value"]["title"].as_str()
+                                .or_else(|| msg["params"]["value"]["message"].as_str())
+                                .unwrap_or("");
+                            eprintln!("[DEBUG] <<< $/progress {kind} {title} (pending: {})", pending.len());
+                        }
+                        // Keep waiting if there are still active tokens
+                        continue;
+                    }
+
+                    if self.verbose && !method.is_empty() {
+                        eprintln!("[DEBUG] <<< notification: {method}");
+                    }
+                }
+                // Timeout — no message arrived within 500ms
+                Ok(None) | Err(_) => {
+                    if pending.is_empty() {
+                        // Server is quiet and nothing is pending — we're ready
+                        break;
+                    }
+                    // Still waiting on progress tokens — keep going
+                }
+            }
+        }
+
+        // Restore the normal read timeout
+        self.transport.set_read_timeout(Some(Duration::from_secs(60)));
     }
 
     pub fn hover(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {

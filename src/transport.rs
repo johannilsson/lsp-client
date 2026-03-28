@@ -16,27 +16,56 @@ impl MessageReader {
         Self { inner: Box::new(r), buf: Vec::new() }
     }
 
-    fn fill(&mut self) -> io::Result<()> {
+    /// Returns Ok(true) if data was read, Ok(false) on timeout/WouldBlock, Err on real errors.
+    fn fill(&mut self) -> io::Result<bool> {
         let mut tmp = [0u8; 4096];
-        let n = self.inner.read(&mut tmp)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed connection"));
+        match self.inner.read(&mut tmp) {
+            Ok(0) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed connection")),
+            Ok(n) => { self.buf.extend_from_slice(&tmp[..n]); Ok(true) }
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
-        self.buf.extend_from_slice(&tmp[..n]);
-        Ok(())
     }
 
     pub fn read_message(&mut self) -> Result<serde_json::Value> {
-        // Read until we have a complete header block ending with \r\n\r\n
-        let header_end = loop {
-            if let Some(pos) = find_bytes(&self.buf, b"\r\n\r\n") {
-                break pos;
+        loop {
+            if let Some(msg) = self.try_parse()? {
+                return Ok(msg);
             }
-            self.fill()?;
+            // Blocking fill — will surface real errors and timeouts as errors
+            match self.fill() {
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    return Err(e.into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Returns None if no complete message is available yet (timeout or partial data).
+    pub fn try_read_message(&mut self) -> Result<Option<serde_json::Value>> {
+        if let Some(msg) = self.try_parse()? {
+            return Ok(Some(msg));
+        }
+        match self.fill() {
+            Ok(false) => Ok(None), // timeout — nothing available
+            Ok(true) => Ok(self.try_parse()?),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn try_parse(&mut self) -> Result<Option<serde_json::Value>> {
+        let Some(header_end) = find_bytes(&self.buf, b"\r\n\r\n") else {
+            return Ok(None);
         };
 
         let header_block = std::str::from_utf8(&self.buf[..header_end])?.to_owned();
-        self.buf.drain(..header_end + 4);
 
         let content_length = header_block
             .lines()
@@ -47,12 +76,13 @@ impl MessageReader {
             .flatten()
             .ok_or("missing or invalid Content-Length header")?;
 
-        while self.buf.len() < content_length {
-            self.fill()?;
+        if self.buf.len() < header_end + 4 + content_length {
+            return Ok(None); // body not yet complete
         }
 
+        self.buf.drain(..header_end + 4);
         let body: Vec<u8> = self.buf.drain(..content_length).collect();
-        Ok(serde_json::from_slice(&body)?)
+        Ok(Some(serde_json::from_slice(&body)?))
     }
 }
 
@@ -64,6 +94,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub struct Transport {
     pub reader: MessageReader,
     pub writer: Box<dyn Write>,
+    /// Kept solely for read-timeout control in TCP mode.
+    timeout_ctrl: Option<TcpStream>,
     _child: Option<Child>,
 }
 
@@ -76,15 +108,7 @@ impl Transport {
         verbose: bool,
     ) -> Result<Self> {
         match TcpStream::connect((host, port)) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-                let writer = stream.try_clone()?;
-                return Ok(Self {
-                    reader: MessageReader::new(stream),
-                    writer: Box::new(writer),
-                    _child: None,
-                });
-            }
+            Ok(stream) => return Ok(Self::from_tcp(stream)?),
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                 if verbose {
                     eprintln!("[DEBUG] Connection refused, starting {server_bin}...");
@@ -113,15 +137,7 @@ impl Transport {
         loop {
             std::thread::sleep(Duration::from_secs(2));
             match TcpStream::connect((host, port)) {
-                Ok(stream) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-                    let writer = stream.try_clone()?;
-                    return Ok(Self {
-                        reader: MessageReader::new(stream),
-                        writer: Box::new(writer),
-                        _child: None,
-                    });
-                }
+                Ok(stream) => return Ok(Self::from_tcp(stream)?),
                 Err(_) if Instant::now() < deadline => continue,
                 Err(_) => {
                     return Err(format!(
@@ -133,14 +149,25 @@ impl Transport {
         }
     }
 
+    fn from_tcp(stream: TcpStream) -> Result<Self> {
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        let writer = stream.try_clone()?;
+        let timeout_ctrl = stream.try_clone()?;
+        Ok(Self {
+            reader: MessageReader::new(stream),
+            writer: Box::new(writer),
+            timeout_ctrl: Some(timeout_ctrl),
+            _child: None,
+        })
+    }
+
     /// Spawn an LSP server and communicate over its stdin/stdout.
-    pub fn stdio(server_bin: &str, extra_args: &[&str]) -> Result<Self> {
+    pub fn stdio(server_bin: &str, server_args: &[&str]) -> Result<Self> {
         let mut child = Command::new(server_bin)
-            .arg("--stdio")
-            .args(extra_args)
+            .args(server_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -158,8 +185,20 @@ impl Transport {
         Ok(Self {
             reader: MessageReader::new(stdout),
             writer: Box::new(stdin),
+            timeout_ctrl: None,
             _child: Some(child),
         })
+    }
+
+    pub fn set_read_timeout(&self, d: Option<Duration>) {
+        if let Some(s) = &self.timeout_ctrl {
+            let _ = s.set_read_timeout(d);
+        }
+    }
+
+    /// Returns true if this transport supports read timeouts (TCP mode only).
+    pub fn supports_timeout(&self) -> bool {
+        self.timeout_ctrl.is_some()
     }
 
     pub fn send_raw(&mut self, body: &str) -> Result<()> {
