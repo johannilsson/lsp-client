@@ -1,3 +1,4 @@
+mod config;
 mod daemon;
 mod format;
 mod session;
@@ -6,14 +7,16 @@ mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::LspSession;
+use session::{IdleResult, LspSession};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
 /// LSP client CLI — connects to a language server and queries it.
 ///
-/// Connects over TCP by default. Use `start` to launch a persistent daemon
-/// that pays the server startup cost only once; subsequent calls auto-connect.
+/// Place a `.lsp-client.toml` in your project root to set `server`,
+/// `language-id`, and other defaults so you don't need to repeat flags.
+/// Run `start` once to launch a persistent daemon; subsequent calls
+/// auto-connect without any extra flags.
 #[derive(Parser)]
 #[command(name = "lsp-client", version)]
 struct Cli {
@@ -25,7 +28,7 @@ struct Cli {
     #[arg(long, default_value = "9999", global = true)]
     port: u16,
 
-    /// Project root directory (defaults to current working directory)
+    /// Project root directory (defaults to .lsp-client.toml location or CWD)
     #[arg(long, global = true)]
     root: Option<String>,
 
@@ -39,6 +42,10 @@ struct Cli {
 
     /// Force use of a session daemon even if none is auto-detected
     #[arg(long, global = true)]
+    daemon: bool,
+
+    /// Deprecated: use --daemon
+    #[arg(long, global = true, hide = true)]
     stdio: bool,
 
     /// Do not pass --stdio to the server process (e.g. sourcekit-lsp uses stdio by default)
@@ -56,6 +63,11 @@ struct Cli {
     /// Enable verbose debug logging to stderr
     #[arg(long, short, global = true)]
     verbose: bool,
+
+    /// Wait for the server to finish indexing before querying (daemon: sends
+    /// waitIdle; direct: uses a 5-minute timeout instead of the default 60s)
+    #[arg(long, global = true)]
+    wait_for_index: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -150,6 +162,12 @@ enum Command {
         /// Seconds of inactivity before the daemon stops itself (0 = never)
         #[arg(long, default_value = "300")]
         idle_timeout: u64,
+        /// Block until the server reports indexing complete before returning
+        #[arg(long)]
+        wait: bool,
+        /// Open this file to trigger full workspace indexing while waiting
+        #[arg(long)]
+        wait_file: Option<String>,
     },
 
     /// Show status of the session daemon for this workspace.
@@ -157,6 +175,15 @@ enum Command {
 
     /// Stop the running LSP session daemon for this workspace.
     Stop,
+
+    /// Wait until the LSP server has finished indexing (no pending progress).
+    ///
+    /// Useful in scripts: `lsp-client wait-ready && lsp-client hover ...`
+    WaitReady {
+        /// Maximum time to wait (default: 60s)
+        #[arg(long, default_value = "60s", value_parser = parse_duration)]
+        wait_timeout: std::time::Duration,
+    },
 
     /// Internal: run as the daemon process (spawned by `start`).
     #[command(hide = true)]
@@ -166,29 +193,93 @@ enum Command {
     },
 }
 
-fn main() {
-    let cli = Cli::parse();
+// ---------------------------------------------------------------------------
+// Effective configuration (CLI args merged with .lsp-client.toml)
+// ---------------------------------------------------------------------------
 
+struct EffectiveConfig {
+    root: String,
+    server: Option<String>,
+    language_id: Option<String>,
+    no_server_stdio_flag: bool,
+    timeout: Option<std::time::Duration>,
+}
+
+fn build_effective_config(cli: &Cli) -> EffectiveConfig {
+    let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+    let search_start = cli.root.as_deref().unwrap_or(&cwd);
+
+    let (config_dir, file_config) = config::find_config(search_start)
+        .map(|(path, cfg)| {
+            let dir = path.parent().unwrap().to_string_lossy().into_owned();
+            (Some(dir), cfg)
+        })
+        .unwrap_or((None, config::FileConfig::default()));
+
+    // CLI > config file `root` field > directory containing config file > CWD
     let root = cli
         .root
         .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into_owned());
+        .or_else(|| file_config.root.clone())
+        .or(config_dir)
+        .unwrap_or(cwd);
+
+    let timeout = cli.timeout.or_else(|| {
+        file_config
+            .timeout
+            .as_deref()
+            .and_then(|s| parse_duration(s).ok())
+    });
+
+    EffectiveConfig {
+        root,
+        server: cli.server.clone().or(file_config.server),
+        language_id: cli.language_id.clone().or(file_config.language_id),
+        no_server_stdio_flag: cli.no_server_stdio_flag
+            || file_config.no_server_stdio_flag.unwrap_or(false),
+        timeout,
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let effective = build_effective_config(&cli);
+    let root = &effective.root;
 
     // ---- Session management commands (no LSP session needed) ---------------
 
     match &cli.command {
-        Command::Start { idle_timeout } => {
-            match start_daemon(&cli, &root, *idle_timeout) {
+        Command::Start { idle_timeout, wait, wait_file } => {
+            match start_daemon(&effective, cli.verbose, *idle_timeout) {
                 Ok(()) => eprintln!("lsp-client daemon started for {root}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             }
+            if *wait {
+                if let Some(info) = SessionInfo::load(root) {
+                    let lang = effective
+                        .language_id
+                        .as_deref()
+                        .unwrap_or(&info.language_id);
+                    if let Err(e) = wait_for_daemon_ready(
+                        &info.socket,
+                        wait_file.as_deref(),
+                        lang,
+                        cli.verbose,
+                        effective.timeout,
+                    ) {
+                        eprintln!("Warning: wait-for-idle failed: {e}");
+                    } else {
+                        eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                    }
+                }
+            }
             return;
         }
         Command::Status => {
-            match SessionInfo::load(&root) {
+            match SessionInfo::load(root) {
                 Some(info) if info.is_alive() => {
                     let uptime =
                         format_uptime(unix_timestamp().saturating_sub(info.started_at));
@@ -234,7 +325,7 @@ fn main() {
             return;
         }
         Command::Stop => {
-            match SessionInfo::load(&root) {
+            match SessionInfo::load(root) {
                 Some(info) if info.is_alive() => {
                     eprintln!("Stopping lsp-client daemon (PID {})...", info.pid);
                     // Ask the daemon to stop cleanly via its control message.
@@ -247,18 +338,18 @@ fn main() {
                     // Wait for session file to disappear (daemon cleaned up).
                     let deadline =
                         std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while session_file::session_path(&root).exists() {
+                    while session_file::session_path(root).exists() {
                         if std::time::Instant::now() >= deadline {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                     // If still there, remove it ourselves.
-                    SessionInfo::delete(&root);
+                    SessionInfo::delete(root);
                     eprintln!("Done.");
                 }
                 Some(_) => {
-                    SessionInfo::delete(&root);
+                    SessionInfo::delete(root);
                     eprintln!("Removed stale session for {root}.");
                 }
                 None => {
@@ -269,17 +360,17 @@ fn main() {
         }
         Command::DaemonRun { idle_timeout } => {
             let server_args: &[&str] =
-                if cli.no_server_stdio_flag { &[] } else { &["--stdio"] };
-            let server = cli.server.as_deref().unwrap_or_else(|| {
+                if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
+            let server = effective.server.as_deref().unwrap_or_else(|| {
                 eprintln!("Error: --server is required");
                 std::process::exit(1);
             });
-            let language_id = cli.language_id.as_deref().unwrap_or_else(|| {
+            let language_id = effective.language_id.as_deref().unwrap_or_else(|| {
                 eprintln!("Error: --language-id is required");
                 std::process::exit(1);
             });
             if let Err(e) = daemon::run_daemon(
-                &root, server, server_args, *idle_timeout, cli.verbose, language_id,
+                root, server, server_args, *idle_timeout, cli.verbose, language_id,
             ) {
                 eprintln!("daemon error: {e}");
                 std::process::exit(1);
@@ -292,12 +383,19 @@ fn main() {
     // ---- Build transport ----------------------------------------------------
 
     // Load session info once — used for both auto-detect and language_id fallback.
-    let session_info = SessionInfo::load(&root);
-    let use_daemon =
-        cli.stdio || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false);
+    let session_info = SessionInfo::load(root);
+
+    // Use daemon if:
+    //   - explicitly requested (--daemon / deprecated --stdio)
+    //   - a live daemon is already running for this root
+    //   - a server binary is configured (auto-start)
+    let use_daemon = cli.daemon
+        || cli.stdio
+        || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false)
+        || effective.server.is_some();
 
     let transport = if use_daemon {
-        connect_or_start_daemon(&cli, &root)
+        connect_or_start_daemon(&effective, cli.verbose, 300)
     } else {
         let server_bin = cli.server.as_deref().unwrap_or_else(|| {
             eprintln!("Error: --server is required (no active daemon found for {root})");
@@ -314,26 +412,70 @@ fn main() {
         }
     };
 
-    if let Some(dur) = cli.timeout {
+    if let Some(dur) = effective.timeout {
         transport.set_read_timeout(Some(dur));
     }
 
     // Resolve language ID: explicit flag > session file > error.
-    let effective_language_id: String = cli.language_id.clone()
-        .or_else(|| session_info.as_ref().map(|i| i.language_id.clone()).filter(|s| !s.is_empty()))
+    // WaitReady does not open files, so it doesn't require a language ID.
+    let effective_language_id: String = effective
+        .language_id
+        .clone()
+        .or_else(|| {
+            session_info
+                .as_ref()
+                .map(|i| i.language_id.clone())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| {
-            eprintln!("Error: --language-id is required (or start a daemon first with --language-id)");
-            std::process::exit(1);
+            if matches!(cli.command, Command::WaitReady { .. }) {
+                String::new()
+            } else {
+                eprintln!(
+                    "Error: --language-id is required (or start a daemon first with --language-id)"
+                );
+                std::process::exit(1);
+            }
         });
 
-    let mut session = LspSession::new(transport, cli.verbose, cli.timeout);
+    let mut session = LspSession::new(transport, cli.verbose, effective.timeout);
+
+    // --wait-for-index: use a longer timeout in direct TCP mode; in daemon mode
+    // we send lsp-client/waitIdle after did_open (below).
+    let did_open_timeout = if cli.wait_for_index && !use_daemon {
+        Some(std::time::Duration::from_secs(300))
+    } else {
+        effective.timeout
+    };
 
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
-        let init_resp = session.initialize(&root)?;
+        // In daemon mode (not Capabilities): skip initialize — the daemon has
+        // the cached result and re-sending it wastes a round trip.
+        let init_resp = if use_daemon && !matches!(cli.command, Command::Capabilities) {
+            serde_json::Value::Null
+        } else {
+            session.initialize(root)?
+        };
+
+        // WaitReady: send lsp-client/waitIdle and exit.
+        if let Command::WaitReady { wait_timeout } = &cli.command {
+            if use_daemon {
+                // Set a generous read timeout so we can wait a long time.
+                session.transport.set_read_timeout(Some(*wait_timeout));
+                session.wait_idle_request()?;
+            } else {
+                session.wait_for_index(*wait_timeout);
+                if matches!(session.last_idle_result, Some(IdleResult::TimedOut)) {
+                    eprintln!("Timed out waiting for server to become idle.");
+                    std::process::exit(2);
+                }
+            }
+            return Ok(());
+        }
 
         let needs_open = !matches!(
             cli.command,
-            Command::WorkspaceSymbols { file: None, .. } | Command::Capabilities
+            Command::WorkspaceSymbols { file: None, .. } | Command::Capabilities | Command::WaitReady { .. }
         );
 
         if needs_open {
@@ -352,13 +494,34 @@ fn main() {
                 Command::Capabilities => unreachable!(),
                 Command::WorkspaceSymbols { file: Some(f), .. } => f.clone(),
                 Command::WorkspaceSymbols { file: None, .. } => unreachable!(),
+                Command::WaitReady { .. } => unreachable!(),
                 Command::Start { .. }
                 | Command::Status
                 | Command::Stop
                 | Command::DaemonRun { .. } => unreachable!(),
             };
             let abs = abs_path(&file);
+            // Temporarily override timeout for did_open if --wait-for-index is set.
+            let saved_timeout = session.timeout;
+            session.timeout = did_open_timeout;
             session.did_open(&abs, &effective_language_id)?;
+            session.timeout = saved_timeout;
+            // wait_for_idle (called inside did_open) sets transport timeout to
+            // session.timeout; restore to the original configured value.
+            if cli.wait_for_index && !use_daemon {
+                session.transport.set_read_timeout(saved_timeout);
+            }
+
+            // In daemon mode with --wait-for-index: send waitIdle so the daemon
+            // blocks until fully indexed before we query.
+            if cli.wait_for_index && use_daemon {
+                let wait_dur =
+                    effective.timeout.unwrap_or(std::time::Duration::from_secs(300));
+                session.transport.set_read_timeout(Some(wait_dur));
+                session.wait_idle_request()?;
+                // Restore the configured timeout for subsequent queries.
+                session.transport.set_read_timeout(effective.timeout);
+            }
         }
 
         match &cli.command {
@@ -375,6 +538,26 @@ fn main() {
             Command::References { file, line, col } => {
                 let abs = abs_path(file);
                 let resp = session.references(&abs, line - 1, col - 1)?;
+                let is_empty =
+                    resp["result"].as_array().map(|a| a.is_empty()).unwrap_or(true);
+                // If empty and we know the server was still indexing, signal that
+                // rather than silently returning nothing.
+                if is_empty
+                    && !use_daemon
+                    && matches!(session.last_idle_result, Some(IdleResult::TimedOut))
+                {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"ok": false, "error": "server not ready", "indexing": true})
+                        );
+                    } else {
+                        eprintln!(
+                            "server not ready: still indexing (use --wait-for-index to wait)"
+                        );
+                    }
+                    std::process::exit(2);
+                }
                 if cli.json { print_json(&resp) } else { println!("{}", format_references(&resp)) }
             }
             Command::Symbols { file } => {
@@ -466,7 +649,8 @@ fn main() {
                     println!("{}", format_inlay_hints(&resp))
                 }
             }
-            Command::Start { .. }
+            Command::WaitReady { .. }
+            | Command::Start { .. }
             | Command::Status
             | Command::Stop
             | Command::DaemonRun { .. } => unreachable!(),
@@ -475,7 +659,11 @@ fn main() {
         Ok(())
     })();
 
-    session.shutdown();
+    // In daemon mode: just drop the session (EOF → daemon loops back to accept).
+    // In direct mode: send shutdown + exit cleanly.
+    if !use_daemon {
+        session.shutdown();
+    }
 
     if let Err(e) = result {
         if cli.json {
@@ -495,27 +683,33 @@ fn main() {
 /// running.  Falls back to a direct stdio spawn if starting the daemon fails
 /// (e.g., on non-Unix platforms).
 #[cfg(unix)]
-fn connect_or_start_daemon(cli: &Cli, root: &str) -> transport::Result<Transport> {
+fn connect_or_start_daemon(
+    effective: &EffectiveConfig,
+    verbose: bool,
+    idle_timeout: u64,
+) -> transport::Result<Transport> {
+    let root = &effective.root;
     // Try an existing live session first.
     if let Some(info) = SessionInfo::load(root) {
         if info.is_alive() {
-            if cli.verbose {
+            if verbose {
                 eprintln!("[DEBUG] connecting to daemon at {}", info.socket);
             }
             return Transport::unix_socket(&info.socket);
         }
         // Stale entry — clean up and fall through to auto-start.
-        if cli.verbose {
+        if verbose {
             eprintln!("[DEBUG] removing stale daemon session");
         }
         SessionInfo::delete(root);
     }
 
     // Auto-start a new daemon and wait for it to signal readiness.
-    if cli.verbose {
+    if verbose {
         eprintln!("[DEBUG] auto-starting daemon for {root}");
     }
-    start_daemon(cli, root, 300).map_err(|e| format!("failed to start daemon: {e}"))?;
+    start_daemon(effective, verbose, idle_timeout)
+        .map_err(|e| format!("failed to start daemon: {e}"))?;
 
     match SessionInfo::load(root) {
         Some(info) => Transport::unix_socket(&info.socket),
@@ -524,38 +718,45 @@ fn connect_or_start_daemon(cli: &Cli, root: &str) -> transport::Result<Transport
 }
 
 #[cfg(not(unix))]
-fn connect_or_start_daemon(cli: &Cli, root: &str) -> transport::Result<Transport> {
-    let _ = root;
-    // No Unix socket support — fall back to spawning directly.
-    let server = cli.server.as_deref().ok_or("--server is required")?;
-    let args: &[&str] = if cli.no_server_stdio_flag { &[] } else { &["--stdio"] };
+fn connect_or_start_daemon(
+    effective: &EffectiveConfig,
+    _verbose: bool,
+    _idle_timeout: u64,
+) -> transport::Result<Transport> {
+    let server = effective.server.as_deref().ok_or("--server is required")?;
+    let args: &[&str] = if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
     Transport::stdio(server, args)
 }
 
 /// Spawn `lsp-client daemon-run` as a background process and block until the
 /// session file appears (daemon has finished initialising), or 30 s elapse.
 fn start_daemon(
-    cli: &Cli,
-    root: &str,
+    effective: &EffectiveConfig,
+    verbose: bool,
     idle_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Stdio;
 
-    let server = cli.server.as_deref().ok_or("--server is required to start a daemon")?;
-    let language_id =
-        cli.language_id.as_deref().ok_or("--language-id is required to start a daemon")?;
+    let server = effective
+        .server
+        .as_deref()
+        .ok_or("--server is required to start a daemon")?;
+    let language_id = effective
+        .language_id
+        .as_deref()
+        .ok_or("--language-id is required to start a daemon")?;
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
 
     // Global flags must come before the subcommand.
-    cmd.arg("--root").arg(root);
+    cmd.arg("--root").arg(&effective.root);
     cmd.arg("--server").arg(server);
     cmd.arg("--language-id").arg(language_id);
-    if cli.no_server_stdio_flag {
+    if effective.no_server_stdio_flag {
         cmd.arg("--no-server-stdio-flag");
     }
-    if cli.verbose {
+    if verbose {
         cmd.arg("--verbose");
     }
     cmd.arg("daemon-run");
@@ -564,12 +765,13 @@ fn start_daemon(
     // Daemon's stdin/stdout are irrelevant; stderr visible only in verbose mode.
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
-    cmd.stderr(if cli.verbose { Stdio::inherit() } else { Stdio::null() });
+    cmd.stderr(if verbose { Stdio::inherit() } else { Stdio::null() });
 
     cmd.spawn()?;
 
     // Poll for the session file to appear — this means the daemon has
     // successfully initialised the LSP server and is ready to accept clients.
+    let root = &effective.root;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if SessionInfo::load(root).map(|i| i.initialized).unwrap_or(false) {
@@ -584,6 +786,41 @@ fn start_daemon(
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// Connect to the daemon, optionally open a file to trigger indexing, then
+/// send `lsp-client/waitIdle` to block until the server is fully idle.
+#[cfg(unix)]
+fn wait_for_daemon_ready(
+    socket: &str,
+    wait_file: Option<&str>,
+    language_id: &str,
+    verbose: bool,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let transport = Transport::unix_socket(socket)?;
+    if let Some(dur) = timeout.or(Some(std::time::Duration::from_secs(300))) {
+        transport.set_read_timeout(Some(dur));
+    }
+    let mut session = LspSession::new(transport, verbose, timeout);
+    // No initialize needed — daemon has the cached result.
+    if let Some(f) = wait_file {
+        let abs = abs_path(f);
+        session.did_open(&abs, language_id)?;
+    }
+    session.wait_idle_request()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn wait_for_daemon_ready(
+    _socket: &str,
+    _wait_file: Option<&str>,
+    _language_id: &str,
+    _verbose: bool,
+    _timeout: Option<std::time::Duration>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("Unix sockets not available on this platform".into())
 }
 
 /// Connect to the daemon socket and send the internal `lsp-client/stop`

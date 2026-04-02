@@ -4,11 +4,23 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IdleResult {
+    /// All $/progress tokens resolved cleanly.
+    AllComplete,
+    /// Deadline reached; tokens may still be pending.
+    TimedOut,
+    /// Server went quiet without any progress tokens being registered.
+    ServerSilent,
+}
+
 pub struct LspSession {
-    transport: Transport,
+    pub transport: Transport,
     next_id: u64,
     verbose: bool,
-    timeout: Option<Duration>,
+    pub timeout: Option<Duration>,
+    /// Result of the most recent `wait_for_idle` call (None in daemon mode).
+    pub last_idle_result: Option<IdleResult>,
 }
 
 fn file_uri(path: &str) -> String {
@@ -18,7 +30,7 @@ fn file_uri(path: &str) -> String {
 
 impl LspSession {
     pub fn new(transport: Transport, verbose: bool, timeout: Option<Duration>) -> Self {
-        Self { transport, next_id: 1, verbose, timeout }
+        Self { transport, next_id: 1, verbose, timeout, last_idle_result: None }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -134,12 +146,30 @@ impl LspSession {
             }
         }))?;
         // Wait for server to finish indexing before we query.
-        // Only possible in TCP mode — stdio transport doesn't support read timeouts.
+        // Only possible in TCP mode — Unix socket (daemon mode) handles this server-side.
         if self.transport.supports_timeout() {
             let max_wait = self.timeout.unwrap_or(Duration::from_secs(60));
-            self.wait_for_idle(max_wait);
+            let result = self.wait_for_idle(max_wait);
+            self.last_idle_result = Some(result);
         }
         Ok(())
+    }
+
+    /// Explicitly wait for the server to finish indexing.  In daemon mode this
+    /// is a no-op (the daemon waits server-side); in direct TCP mode it drains
+    /// $/progress notifications for up to `max_wait`.
+    pub fn wait_for_index(&mut self, max_wait: Duration) {
+        if self.transport.supports_timeout() {
+            let result = self.wait_for_idle(max_wait);
+            self.last_idle_result = Some(result);
+        }
+    }
+
+    /// Send a `lsp-client/waitIdle` request to the daemon and block until it
+    /// responds (i.e., until the underlying LSP server is idle).  Only
+    /// meaningful in daemon mode; in direct TCP mode prefer `wait_for_index`.
+    pub fn wait_idle_request(&mut self) -> Result<Value> {
+        self.request("lsp-client/waitIdle", json!({}))
     }
 
     /// Read and discard incoming messages until the server goes quiet and all
@@ -147,17 +177,18 @@ impl LspSession {
     ///
     /// This is necessary because servers like kotlin-lsp index asynchronously
     /// after didOpen and return empty results if queried before indexing finishes.
-    fn wait_for_idle(&mut self, max_wait: Duration) {
+    fn wait_for_idle(&mut self, max_wait: Duration) -> IdleResult {
         let mut pending: HashSet<serde_json::Value> = HashSet::new();
         let deadline = Instant::now() + max_wait;
         let mut last_activity = Instant::now();
+        let mut any_tokens = false;
 
         // Use a short read timeout so we can detect when the server goes quiet.
         self.transport.set_read_timeout(Some(Duration::from_millis(500)));
 
-        loop {
+        let outcome = loop {
             if Instant::now() >= deadline {
-                break;
+                break IdleResult::TimedOut;
             }
 
             match self.transport.reader.try_read_message() {
@@ -167,6 +198,7 @@ impl LspSession {
 
                     // Ack any server-initiated requests (e.g. window/workDoneProgress/create)
                     if method == "window/workDoneProgress/create" {
+                        any_tokens = true;
                         if let Some(token) = msg["params"].get("token") {
                             pending.insert(token.clone());
                         }
@@ -185,7 +217,7 @@ impl LspSession {
                         let token = &msg["params"]["token"];
                         let kind = msg["params"]["value"]["kind"].as_str().unwrap_or("");
                         match kind {
-                            "begin" => { pending.insert(token.clone()); }
+                            "begin" => { any_tokens = true; pending.insert(token.clone()); }
                             "end" => { pending.remove(token); }
                             _ => {}
                         }
@@ -195,7 +227,10 @@ impl LspSession {
                                 .unwrap_or("");
                             eprintln!("[DEBUG] <<< $/progress {kind} {title} (pending: {})", pending.len());
                         }
-                        // Keep waiting if there are still active tokens
+                        // If all tokens resolved, we're done
+                        if pending.is_empty() && any_tokens {
+                            break IdleResult::AllComplete;
+                        }
                         continue;
                     }
 
@@ -208,14 +243,15 @@ impl LspSession {
                     // Break if server is quiet with no outstanding tokens, OR if tokens
                     // exist but the server has gone silent (server forgot to send "end").
                     if pending.is_empty() || last_activity.elapsed() >= Duration::from_secs(2) {
-                        break;
+                        break if any_tokens { IdleResult::AllComplete } else { IdleResult::ServerSilent };
                     }
                 }
             }
-        }
+        };
 
         // Restore the configured read timeout
         self.transport.set_read_timeout(self.timeout.or(Some(Duration::from_secs(60))));
+        outcome
     }
 
 

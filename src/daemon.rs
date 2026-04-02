@@ -235,11 +235,18 @@ fn handle_connection(
             }
 
             // ------------------------------------------------------------------
-            // Internal control message
+            // Internal control messages
             // ------------------------------------------------------------------
             Some("lsp-client/stop") => {
                 // Signal to the main loop that the daemon should shut down.
                 return true;
+            }
+            Some("lsp-client/waitIdle") => {
+                // Block until the server finishes all in-progress work, then
+                // respond so the caller knows it's safe to query.
+                core.wait_for_idle();
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":"idle"});
+                let _ = send_framed(&mut writer, &resp);
             }
 
             // ------------------------------------------------------------------
