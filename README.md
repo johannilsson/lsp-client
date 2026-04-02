@@ -14,21 +14,35 @@ cargo install --path .
 lsp-client [OPTIONS] <COMMAND>
 
 Commands:
-  hover              <file> <line> <col>
-  definition         <file> <line> <col>
-  references         <file> <line> <col>
-  symbols            <file>
-  workspace-symbols  <query>
-  diagnostics        <file>
-  completion         <file> <line> <col>
-  signature-help     <file> <line> <col>
-  code-action        <file> <line> <col>
-  rename             <file> <line> <col> <new-name>
-  semantic-tokens    <file>
-  inlay-hints        <file> [--start-line N] [--end-line N]
-  start              Start a persistent daemon for this workspace
-  status             Show daemon status (PID, socket, uptime)
-  stop               Stop the daemon
+  query         Run an LSP query against a file or workspace
+  session       Manage the persistent LSP session daemon
+  capabilities  List capabilities reported by the server
+```
+
+### Query subcommands
+
+```
+lsp-client query hover             <file> <line> <col>
+lsp-client query definition        <file> <line> <col>
+lsp-client query references        <file> <line> <col>
+lsp-client query symbols           <file>
+lsp-client query workspace-symbols <query>
+lsp-client query diagnostics       <file>
+lsp-client query completion        <file> <line> <col>
+lsp-client query signature-help    <file> <line> <col>
+lsp-client query code-action       <file> <line> <col>
+lsp-client query rename            <file> <line> <col> <new-name>
+lsp-client query semantic-tokens   <file>
+lsp-client query inlay-hints       <file> [--start-line N] [--end-line N]
+```
+
+### Session subcommands
+
+```
+lsp-client session start      Start a persistent daemon for this workspace
+lsp-client session status     Show daemon status (PID, socket, uptime)
+lsp-client session stop       Stop the daemon
+lsp-client session wait-ready Wait until the server has finished indexing
 ```
 
 Line and column numbers are 1-based.
@@ -39,17 +53,17 @@ Start a daemon once per workspace. Subsequent calls auto-connect.
 
 ```sh
 # Start daemon
-lsp-client start --server <binary> --language-id <id> [--root /path/to/project]
+lsp-client session start --server <binary> --language-id <id> [--root /path/to/project]
 
 # Query (auto-connects to daemon; --root defaults to cwd)
-lsp-client symbols src/Foo.kt
-lsp-client hover src/Foo.kt 42 10
+lsp-client query symbols src/Foo.kt
+lsp-client query hover src/Foo.kt 42 10
 
 # Check status
-lsp-client status
+lsp-client session status
 
 # Stop
-lsp-client stop
+lsp-client session stop
 ```
 
 ## Options
@@ -76,11 +90,11 @@ kotlin-lsp runs as a persistent TCP server, so daemon mode is optional — it au
 brew install JetBrains/utils/kotlin-lsp
 
 # One-shot (auto-starts server on first call)
-lsp-client --server kotlin-lsp --language-id kotlin --root /my/project symbols src/Main.kt
+lsp-client --server kotlin-lsp --language-id kotlin --root /my/project query symbols src/Main.kt
 
 # Or with daemon
-lsp-client start --server kotlin-lsp --language-id kotlin --root /my/project
-lsp-client symbols src/Main.kt
+lsp-client session start --server kotlin-lsp --language-id kotlin --root /my/project
+lsp-client query symbols src/Main.kt
 ```
 
 ### sourcekit-lsp (Swift)
@@ -89,16 +103,16 @@ sourcekit-lsp communicates over stdio and starts fresh per invocation, so the da
 
 ```sh
 # sourcekit-lsp uses stdio by default — don't pass --stdio to the process
-lsp-client start --server sourcekit-lsp --no-server-stdio-flag --language-id swift --root /my/project
-lsp-client symbols Sources/App.swift
-lsp-client --timeout 15s hover Sources/App.swift 10 5
+lsp-client session start --server sourcekit-lsp --no-server-stdio-flag --language-id swift --root /my/project
+lsp-client query symbols Sources/App.swift
+lsp-client --timeout 15s query hover Sources/App.swift 10 5
 ```
 
 ### rust-analyzer
 
 ```sh
-lsp-client start --server rust-analyzer --no-server-stdio-flag --language-id rust --root /my/project
-lsp-client diagnostics src/main.rs
+lsp-client session start --server rust-analyzer --no-server-stdio-flag --language-id rust --root /my/project
+lsp-client query diagnostics src/main.rs
 ```
 
 ## How it works

@@ -15,7 +15,7 @@ use transport::Transport;
 ///
 /// Place a `.lsp-client.toml` in your project root to set `server`,
 /// `language-id`, and other defaults so you don't need to repeat flags.
-/// Run `start` once to launch a persistent daemon; subsequent calls
+/// Run `session start` once to launch a persistent daemon; subsequent calls
 /// auto-connect without any extra flags.
 #[derive(Parser)]
 #[command(name = "lsp-client", version)]
@@ -75,6 +75,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run an LSP query against a file or workspace
+    Query {
+        #[command(subcommand)]
+        command: QueryCommand,
+    },
+    /// Manage the persistent LSP session daemon
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// List capabilities reported by the server
+    Capabilities,
+}
+
+#[derive(Subcommand)]
+enum QueryCommand {
     /// Get type/doc info at a position
     Hover {
         file: String,
@@ -136,8 +152,6 @@ enum Command {
     },
     /// Get semantic tokens for a file
     SemanticTokens { file: String },
-    /// List capabilities reported by the server
-    Capabilities,
     /// Get inlay hints for a file or line range
     InlayHints {
         file: String,
@@ -148,11 +162,10 @@ enum Command {
         #[arg(long)]
         end_line: Option<u32>,
     },
+}
 
-    // ------------------------------------------------------------------
-    // Session management
-    // ------------------------------------------------------------------
-
+#[derive(Subcommand)]
+enum SessionCommand {
     /// Start a persistent LSP session daemon for this workspace.
     ///
     /// The daemon owns the server process and exposes a Unix socket so that
@@ -178,14 +191,14 @@ enum Command {
 
     /// Wait until the LSP server has finished indexing (no pending progress).
     ///
-    /// Useful in scripts: `lsp-client wait-ready && lsp-client hover ...`
+    /// Useful in scripts: `lsp-client session wait-ready && lsp-client query hover ...`
     WaitReady {
         /// Maximum time to wait (default: 60s)
         #[arg(long, default_value = "60s", value_parser = parse_duration)]
         wait_timeout: std::time::Duration,
     },
 
-    /// Internal: run as the daemon process (spawned by `start`).
+    /// Internal: run as the daemon process (spawned by `session start`).
     #[command(hide = true)]
     DaemonRun {
         #[arg(long, default_value = "300")]
@@ -248,136 +261,138 @@ fn main() {
 
     // ---- Session management commands (no LSP session needed) ---------------
 
-    match &cli.command {
-        Command::Start { idle_timeout, wait, wait_file } => {
-            match start_daemon(&effective, cli.verbose, *idle_timeout) {
-                Ok(()) => eprintln!("lsp-client daemon started for {root}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-            if *wait {
-                if let Some(info) = SessionInfo::load(root) {
-                    let lang = effective
-                        .language_id
-                        .as_deref()
-                        .unwrap_or(&info.language_id);
-                    if let Err(e) = wait_for_daemon_ready(
-                        &info.socket,
-                        wait_file.as_deref(),
-                        lang,
-                        cli.verbose,
-                        effective.timeout,
-                    ) {
-                        eprintln!("Warning: wait-for-idle failed: {e}");
-                    } else {
-                        eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+    if let Command::Session { command } = &cli.command {
+        match command {
+            SessionCommand::Start { idle_timeout, wait, wait_file } => {
+                match start_daemon(&effective, cli.verbose, *idle_timeout) {
+                    Ok(()) => eprintln!("lsp-client daemon started for {root}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
                     }
                 }
-            }
-            return;
-        }
-        Command::Status => {
-            match SessionInfo::load(root) {
-                Some(info) if info.is_alive() => {
-                    let uptime =
-                        format_uptime(unix_timestamp().saturating_sub(info.started_at));
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "status":      "running",
-                                "pid":         info.pid,
-                                "socket":      info.socket,
-                                "server":      info.server,
-                                "language_id": info.language_id,
-                                "workspace":   info.workspace,
-                                "uptime":      uptime,
-                            })
-                        );
-                    } else {
-                        println!("status:      running");
-                        println!("pid:         {}", info.pid);
-                        println!("socket:      {}", info.socket);
-                        println!("server:      {}", info.server);
-                        println!("language_id: {}", info.language_id);
-                        println!("uptime:      {uptime}");
-                    }
-                }
-                Some(_) => {
-                    if cli.json {
-                        println!("{}", serde_json::json!({"status": "dead"}));
-                    } else {
-                        eprintln!("status:      dead (stale session)");
-                    }
-                    std::process::exit(1);
-                }
-                None => {
-                    if cli.json {
-                        println!("{}", serde_json::json!({"status": "not running"}));
-                    } else {
-                        eprintln!("status:      not running");
-                    }
-                    std::process::exit(1);
-                }
-            }
-            return;
-        }
-        Command::Stop => {
-            match SessionInfo::load(root) {
-                Some(info) if info.is_alive() => {
-                    eprintln!("Stopping lsp-client daemon (PID {})...", info.pid);
-                    // Ask the daemon to stop cleanly via its control message.
-                    // Fall back to SIGTERM if we can't connect.
-                    if send_stop_to_daemon(&info.socket, cli.verbose).is_err() {
-                        let _ = std::process::Command::new("kill")
-                            .arg(info.pid.to_string())
-                            .status();
-                    }
-                    // Wait for session file to disappear (daemon cleaned up).
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while session_file::session_path(root).exists() {
-                        if std::time::Instant::now() >= deadline {
-                            break;
+                if *wait {
+                    if let Some(info) = SessionInfo::load(root) {
+                        let lang = effective
+                            .language_id
+                            .as_deref()
+                            .unwrap_or(&info.language_id);
+                        if let Err(e) = wait_for_daemon_ready(
+                            &info.socket,
+                            wait_file.as_deref(),
+                            lang,
+                            cli.verbose,
+                            effective.timeout,
+                        ) {
+                            eprintln!("Warning: wait-for-idle failed: {e}");
+                        } else {
+                            eprintln!("lsp-client daemon ready (indexing complete) for {root}");
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
-                    // If still there, remove it ourselves.
-                    SessionInfo::delete(root);
-                    eprintln!("Done.");
                 }
-                Some(_) => {
-                    SessionInfo::delete(root);
-                    eprintln!("Removed stale session for {root}.");
-                }
-                None => {
-                    eprintln!("No active daemon session for {root}.");
-                }
+                return;
             }
-            return;
-        }
-        Command::DaemonRun { idle_timeout } => {
-            let server_args: &[&str] =
-                if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
-            let server = effective.server.as_deref().unwrap_or_else(|| {
-                eprintln!("Error: --server is required");
-                std::process::exit(1);
-            });
-            let language_id = effective.language_id.as_deref().unwrap_or_else(|| {
-                eprintln!("Error: --language-id is required");
-                std::process::exit(1);
-            });
-            if let Err(e) = daemon::run_daemon(
-                root, server, server_args, *idle_timeout, cli.verbose, language_id,
-            ) {
-                eprintln!("daemon error: {e}");
-                std::process::exit(1);
+            SessionCommand::Status => {
+                match SessionInfo::load(root) {
+                    Some(info) if info.is_alive() => {
+                        let uptime =
+                            format_uptime(unix_timestamp().saturating_sub(info.started_at));
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status":      "running",
+                                    "pid":         info.pid,
+                                    "socket":      info.socket,
+                                    "server":      info.server,
+                                    "language_id": info.language_id,
+                                    "workspace":   info.workspace,
+                                    "uptime":      uptime,
+                                })
+                            );
+                        } else {
+                            println!("status:      running");
+                            println!("pid:         {}", info.pid);
+                            println!("socket:      {}", info.socket);
+                            println!("server:      {}", info.server);
+                            println!("language_id: {}", info.language_id);
+                            println!("uptime:      {uptime}");
+                        }
+                    }
+                    Some(_) => {
+                        if cli.json {
+                            println!("{}", serde_json::json!({"status": "dead"}));
+                        } else {
+                            eprintln!("status:      dead (stale session)");
+                        }
+                        std::process::exit(1);
+                    }
+                    None => {
+                        if cli.json {
+                            println!("{}", serde_json::json!({"status": "not running"}));
+                        } else {
+                            eprintln!("status:      not running");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                return;
             }
-            return;
+            SessionCommand::Stop => {
+                match SessionInfo::load(root) {
+                    Some(info) if info.is_alive() => {
+                        eprintln!("Stopping lsp-client daemon (PID {})...", info.pid);
+                        // Ask the daemon to stop cleanly via its control message.
+                        // Fall back to SIGTERM if we can't connect.
+                        if send_stop_to_daemon(&info.socket, cli.verbose).is_err() {
+                            let _ = std::process::Command::new("kill")
+                                .arg(info.pid.to_string())
+                                .status();
+                        }
+                        // Wait for session file to disappear (daemon cleaned up).
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while session_file::session_path(root).exists() {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        // If still there, remove it ourselves.
+                        SessionInfo::delete(root);
+                        eprintln!("Done.");
+                    }
+                    Some(_) => {
+                        SessionInfo::delete(root);
+                        eprintln!("Removed stale session for {root}.");
+                    }
+                    None => {
+                        eprintln!("No active daemon session for {root}.");
+                    }
+                }
+                return;
+            }
+            SessionCommand::DaemonRun { idle_timeout } => {
+                let server_args: &[&str] =
+                    if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
+                let server = effective.server.as_deref().unwrap_or_else(|| {
+                    eprintln!("Error: --server is required");
+                    std::process::exit(1);
+                });
+                let language_id = effective.language_id.as_deref().unwrap_or_else(|| {
+                    eprintln!("Error: --language-id is required");
+                    std::process::exit(1);
+                });
+                if let Err(e) = daemon::run_daemon(
+                    root, server, server_args, *idle_timeout, cli.verbose, language_id,
+                ) {
+                    eprintln!("daemon error: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            SessionCommand::WaitReady { .. } => {} // handled below via LSP session
         }
-        _ => {}
     }
 
     // ---- Build transport ----------------------------------------------------
@@ -428,7 +443,10 @@ fn main() {
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| {
-            if matches!(cli.command, Command::WaitReady { .. }) {
+            if matches!(
+                cli.command,
+                Command::Session { command: SessionCommand::WaitReady { .. } }
+            ) {
                 String::new()
             } else {
                 eprintln!(
@@ -458,7 +476,9 @@ fn main() {
         };
 
         // WaitReady: send lsp-client/waitIdle and exit.
-        if let Command::WaitReady { wait_timeout } = &cli.command {
+        if let Command::Session { command: SessionCommand::WaitReady { wait_timeout } } =
+            &cli.command
+        {
             if use_daemon {
                 // Set a generous read timeout so we can wait a long time.
                 session.transport.set_read_timeout(Some(*wait_timeout));
@@ -475,30 +495,29 @@ fn main() {
 
         let needs_open = !matches!(
             cli.command,
-            Command::WorkspaceSymbols { file: None, .. } | Command::Capabilities | Command::WaitReady { .. }
+            Command::Query { command: QueryCommand::WorkspaceSymbols { file: None, .. } }
+                | Command::Capabilities
+                | Command::Session { command: SessionCommand::WaitReady { .. } }
         );
 
         if needs_open {
             let file = match &cli.command {
-                Command::Hover { file, .. }
-                | Command::Definition { file, .. }
-                | Command::References { file, .. }
-                | Command::Symbols { file }
-                | Command::Diagnostics { file }
-                | Command::Completion { file, .. }
-                | Command::SignatureHelp { file, .. }
-                | Command::CodeAction { file, .. }
-                | Command::Rename { file, .. }
-                | Command::SemanticTokens { file }
-                | Command::InlayHints { file, .. } => file.clone(),
-                Command::Capabilities => unreachable!(),
-                Command::WorkspaceSymbols { file: Some(f), .. } => f.clone(),
-                Command::WorkspaceSymbols { file: None, .. } => unreachable!(),
-                Command::WaitReady { .. } => unreachable!(),
-                Command::Start { .. }
-                | Command::Status
-                | Command::Stop
-                | Command::DaemonRun { .. } => unreachable!(),
+                Command::Query { command } => match command {
+                    QueryCommand::Hover { file, .. }
+                    | QueryCommand::Definition { file, .. }
+                    | QueryCommand::References { file, .. }
+                    | QueryCommand::Symbols { file }
+                    | QueryCommand::Diagnostics { file }
+                    | QueryCommand::Completion { file, .. }
+                    | QueryCommand::SignatureHelp { file, .. }
+                    | QueryCommand::CodeAction { file, .. }
+                    | QueryCommand::Rename { file, .. }
+                    | QueryCommand::SemanticTokens { file }
+                    | QueryCommand::InlayHints { file, .. } => file.clone(),
+                    QueryCommand::WorkspaceSymbols { file: Some(f), .. } => f.clone(),
+                    QueryCommand::WorkspaceSymbols { file: None, .. } => unreachable!(),
+                },
+                _ => unreachable!(),
             };
             let abs = abs_path(&file);
             // Temporarily override timeout for did_open if --wait-for-index is set.
@@ -525,76 +544,124 @@ fn main() {
         }
 
         match &cli.command {
-            Command::Hover { file, line, col } => {
-                let abs = abs_path(file);
-                let resp = session.hover(&abs, line - 1, col - 1)?;
-                if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp)) }
-            }
-            Command::Definition { file, line, col } => {
-                let abs = abs_path(file);
-                let resp = session.definition(&abs, line - 1, col - 1)?;
-                if cli.json { print_json(&resp) } else { println!("{}", format_definition(&resp)) }
-            }
-            Command::References { file, line, col } => {
-                let abs = abs_path(file);
-                let resp = session.references(&abs, line - 1, col - 1)?;
-                let is_empty =
-                    resp["result"].as_array().map(|a| a.is_empty()).unwrap_or(true);
-                // If empty and we know the server was still indexing, signal that
-                // rather than silently returning nothing.
-                if is_empty
-                    && !use_daemon
-                    && matches!(session.last_idle_result, Some(IdleResult::TimedOut))
-                {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"ok": false, "error": "server not ready", "indexing": true})
-                        );
-                    } else {
-                        eprintln!(
-                            "server not ready: still indexing (use --wait-for-index to wait)"
-                        );
-                    }
-                    std::process::exit(2);
+            Command::Query { command } => match command {
+                QueryCommand::Hover { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.hover(&abs, line - 1, col - 1)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp)) }
                 }
-                if cli.json { print_json(&resp) } else { println!("{}", format_references(&resp)) }
-            }
-            Command::Symbols { file } => {
-                let abs = abs_path(file);
-                let resp = session.document_symbols(&abs)?;
-                if cli.json { print_json(&resp) } else { println!("{}", format_symbols(&resp)) }
-            }
-            Command::WorkspaceSymbols { query, retries, .. } => {
-                let mut resp = session.workspace_symbols(query)?;
-                for _ in 0..*retries {
+                QueryCommand::Definition { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.definition(&abs, line - 1, col - 1)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_definition(&resp)) }
+                }
+                QueryCommand::References { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.references(&abs, line - 1, col - 1)?;
                     let is_empty =
                         resp["result"].as_array().map(|a| a.is_empty()).unwrap_or(true);
-                    if !is_empty {
-                        break;
+                    // If empty and we know the server was still indexing, signal that
+                    // rather than silently returning nothing.
+                    if is_empty
+                        && !use_daemon
+                        && matches!(session.last_idle_result, Some(IdleResult::TimedOut))
+                    {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"ok": false, "error": "server not ready", "indexing": true})
+                            );
+                        } else {
+                            eprintln!(
+                                "server not ready: still indexing (use --wait-for-index to wait)"
+                            );
+                        }
+                        std::process::exit(2);
                     }
-                    if cli.verbose {
-                        eprintln!("[DEBUG] empty result, retrying...");
+                    if cli.json { print_json(&resp) } else { println!("{}", format_references(&resp)) }
+                }
+                QueryCommand::Symbols { file } => {
+                    let abs = abs_path(file);
+                    let resp = session.document_symbols(&abs)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_symbols(&resp)) }
+                }
+                QueryCommand::WorkspaceSymbols { query, retries, .. } => {
+                    let mut resp = session.workspace_symbols(query)?;
+                    for _ in 0..*retries {
+                        let is_empty =
+                            resp["result"].as_array().map(|a| a.is_empty()).unwrap_or(true);
+                        if !is_empty {
+                            break;
+                        }
+                        if cli.verbose {
+                            eprintln!("[DEBUG] empty result, retrying...");
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        resp = session.workspace_symbols(query)?;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    resp = session.workspace_symbols(query)?;
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        println!("{}", format_workspace_symbols(&resp))
+                    }
                 }
-                if cli.json {
-                    print_json(&resp)
-                } else {
-                    println!("{}", format_workspace_symbols(&resp))
+                QueryCommand::Diagnostics { file } => {
+                    let abs = abs_path(file);
+                    let resp = session.diagnostics(&abs)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_diagnostics(&resp)) }
                 }
-            }
-            Command::Diagnostics { file } => {
-                let abs = abs_path(file);
-                let resp = session.diagnostics(&abs)?;
-                if cli.json { print_json(&resp) } else { println!("{}", format_diagnostics(&resp)) }
-            }
-            Command::Completion { file, line, col } => {
-                let abs = abs_path(file);
-                let resp = session.completion(&abs, line - 1, col - 1)?;
-                if cli.json { print_json(&resp) } else { println!("{}", format_completion(&resp)) }
-            }
+                QueryCommand::Completion { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.completion(&abs, line - 1, col - 1)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_completion(&resp)) }
+                }
+                QueryCommand::SignatureHelp { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.signature_help(&abs, line - 1, col - 1)?;
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        println!("{}", format_signature_help(&resp))
+                    }
+                }
+                QueryCommand::CodeAction { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.code_action(&abs, line - 1, col - 1)?;
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        println!("{}", format_code_actions(&resp))
+                    }
+                }
+                QueryCommand::Rename { file, line, col, new_name } => {
+                    let abs = abs_path(file);
+                    let resp = session.rename(&abs, line - 1, col - 1, new_name)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_rename(&resp)) }
+                }
+                QueryCommand::SemanticTokens { file } => {
+                    let abs = abs_path(file);
+                    let resp = session.semantic_tokens(&abs)?;
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        println!("{}", format_semantic_tokens(&resp))
+                    }
+                }
+                QueryCommand::InlayHints { file, start_line, end_line } => {
+                    let abs = abs_path(file);
+                    let end = end_line.unwrap_or_else(|| {
+                        std::fs::read_to_string(&abs)
+                            .map(|s| s.lines().count() as u32)
+                            .unwrap_or(u32::MAX / 2)
+                    });
+                    let resp = session.inlay_hints(&abs, start_line - 1, end)?;
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        println!("{}", format_inlay_hints(&resp))
+                    }
+                }
+            },
             Command::Capabilities => {
                 let caps = &init_resp["result"]["capabilities"];
                 if cli.json {
@@ -603,57 +670,7 @@ fn main() {
                     println!("{}", format_capabilities(caps))
                 }
             }
-            Command::SignatureHelp { file, line, col } => {
-                let abs = abs_path(file);
-                let resp = session.signature_help(&abs, line - 1, col - 1)?;
-                if cli.json {
-                    print_json(&resp)
-                } else {
-                    println!("{}", format_signature_help(&resp))
-                }
-            }
-            Command::CodeAction { file, line, col } => {
-                let abs = abs_path(file);
-                let resp = session.code_action(&abs, line - 1, col - 1)?;
-                if cli.json {
-                    print_json(&resp)
-                } else {
-                    println!("{}", format_code_actions(&resp))
-                }
-            }
-            Command::Rename { file, line, col, new_name } => {
-                let abs = abs_path(file);
-                let resp = session.rename(&abs, line - 1, col - 1, new_name)?;
-                if cli.json { print_json(&resp) } else { println!("{}", format_rename(&resp)) }
-            }
-            Command::SemanticTokens { file } => {
-                let abs = abs_path(file);
-                let resp = session.semantic_tokens(&abs)?;
-                if cli.json {
-                    print_json(&resp)
-                } else {
-                    println!("{}", format_semantic_tokens(&resp))
-                }
-            }
-            Command::InlayHints { file, start_line, end_line } => {
-                let abs = abs_path(file);
-                let end = end_line.unwrap_or_else(|| {
-                    std::fs::read_to_string(&abs)
-                        .map(|s| s.lines().count() as u32)
-                        .unwrap_or(u32::MAX / 2)
-                });
-                let resp = session.inlay_hints(&abs, start_line - 1, end)?;
-                if cli.json {
-                    print_json(&resp)
-                } else {
-                    println!("{}", format_inlay_hints(&resp))
-                }
-            }
-            Command::WaitReady { .. }
-            | Command::Start { .. }
-            | Command::Status
-            | Command::Stop
-            | Command::DaemonRun { .. } => unreachable!(),
+            Command::Session { .. } => unreachable!(),
         }
 
         Ok(())
@@ -728,8 +745,9 @@ fn connect_or_start_daemon(
     Transport::stdio(server, args)
 }
 
-/// Spawn `lsp-client daemon-run` as a background process and block until the
-/// session file appears (daemon has finished initialising), or 30 s elapse.
+/// Spawn `lsp-client session daemon-run` as a background process and block
+/// until the session file appears (daemon has finished initialising), or 30 s
+/// elapse.
 fn start_daemon(
     effective: &EffectiveConfig,
     verbose: bool,
@@ -759,6 +777,7 @@ fn start_daemon(
     if verbose {
         cmd.arg("--verbose");
     }
+    cmd.arg("session");
     cmd.arg("daemon-run");
     cmd.arg("--idle-timeout").arg(idle_timeout.to_string());
 
@@ -779,7 +798,7 @@ fn start_daemon(
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "daemon did not become ready within 30 s (check '{} --verbose start')",
+                "daemon did not become ready within 30 s (check '{} --verbose session start')",
                 exe.display()
             )
             .into());
