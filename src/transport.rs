@@ -1,6 +1,5 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-#[cfg(not(unix))]
 use std::process::{ChildStdin, ChildStdout};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -184,7 +183,6 @@ impl Transport {
     }
 
     /// Spawn an LSP server and communicate over its stdin/stdout.
-    #[cfg(not(unix))]
     pub fn stdio(server_bin: &str, server_args: &[&str]) -> Result<Self> {
         let mut child = Command::new(server_bin)
             .args(server_args)

@@ -400,23 +400,36 @@ fn main() {
     // Load session info once — used for both auto-detect and language_id fallback.
     let session_info = SessionInfo::load(root);
 
+    // `capabilities --server <bin>` means "query this specific server directly" —
+    // bypass any running daemon so we don't return a different server's capabilities.
+    let caps_direct =
+        matches!(cli.command, Command::Capabilities) && effective.server.is_some();
+
     // Use daemon if:
     //   - explicitly requested (--daemon / deprecated --stdio)
     //   - a live daemon is already running for this root
     //   - a server binary is configured (auto-start)
-    let use_daemon = cli.daemon
-        || cli.stdio
-        || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false)
-        || effective.server.is_some();
+    // …but not when we're doing a direct capabilities probe.
+    let use_daemon = !caps_direct
+        && (cli.daemon
+            || cli.stdio
+            || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false)
+            || effective.server.is_some());
 
     let transport = if use_daemon {
         connect_or_start_daemon(&effective, cli.verbose, 300)
     } else {
-        let server_bin = cli.server.as_deref().unwrap_or_else(|| {
+        let server_bin = effective.server.as_deref().unwrap_or_else(|| {
             eprintln!("Error: --server is required (no active daemon found for {root})");
             std::process::exit(1);
         });
-        Transport::tcp_with_autostart(&cli.host, cli.port, server_bin, cli.verbose)
+        if caps_direct {
+            // Spawn the server directly over stdio for capabilities introspection.
+            let args: &[&str] = if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
+            Transport::stdio(server_bin, args)
+        } else {
+            Transport::tcp_with_autostart(&cli.host, cli.port, server_bin, cli.verbose)
+        }
     };
 
     let transport = match transport {
