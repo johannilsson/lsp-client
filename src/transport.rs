@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(not(unix))]
+use std::process::{ChildStdin, ChildStdout};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -12,7 +14,7 @@ pub struct MessageReader {
 }
 
 impl MessageReader {
-    fn new(r: impl Read + 'static) -> Self {
+    pub fn new(r: impl Read + 'static) -> Self {
         Self { inner: Box::new(r), buf: Vec::new() }
     }
 
@@ -162,6 +164,7 @@ impl Transport {
     }
 
     /// Spawn an LSP server and communicate over its stdin/stdout.
+    #[cfg(not(unix))]
     pub fn stdio(server_bin: &str, server_args: &[&str]) -> Result<Self> {
         let mut child = Command::new(server_bin)
             .args(server_args)
@@ -187,6 +190,26 @@ impl Transport {
             writer: Box::new(stdin),
             timeout_ctrl: None,
             _child: Some(child),
+        })
+    }
+
+    /// Connect to a running lsp-client daemon over a Unix domain socket.
+    ///
+    /// The daemon handles the initialize handshake and wait_for_idle internally,
+    /// so this transport deliberately does NOT support read timeouts
+    /// (`supports_timeout` returns false).  That keeps `LspSession` from calling
+    /// `wait_for_idle` on the client side, which would race with the daemon.
+    #[cfg(unix)]
+    pub fn unix_socket(path: &str) -> Result<Self> {
+        use std::os::unix::net::UnixStream;
+        let stream = UnixStream::connect(path)
+            .map_err(|e| format!("cannot connect to daemon socket {path}: {e}"))?;
+        let writer = stream.try_clone()?;
+        Ok(Self {
+            reader: MessageReader::new(stream),
+            writer: Box::new(writer),
+            timeout_ctrl: None,
+            _child: None,
         })
     }
 

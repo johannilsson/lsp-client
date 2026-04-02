@@ -214,6 +214,7 @@ impl LspSession {
         self.transport.set_read_timeout(Some(Duration::from_secs(60)));
     }
 
+
     pub fn hover(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
         self.request("textDocument/hover", json!({
             "textDocument": {"uri": file_uri(file_path)},
