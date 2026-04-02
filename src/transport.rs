@@ -12,7 +12,7 @@ pub struct MessageReader {
 }
 
 impl MessageReader {
-    fn new(r: impl Read + 'static) -> Self {
+    pub fn new(r: impl Read + 'static) -> Self {
         Self { inner: Box::new(r), buf: Vec::new() }
     }
 
@@ -187,6 +187,26 @@ impl Transport {
             writer: Box::new(stdin),
             timeout_ctrl: None,
             _child: Some(child),
+        })
+    }
+
+    /// Connect to a running lsp-client daemon over a Unix domain socket.
+    ///
+    /// The daemon handles the initialize handshake and wait_for_idle internally,
+    /// so this transport deliberately does NOT support read timeouts
+    /// (`supports_timeout` returns false).  That keeps `LspSession` from calling
+    /// `wait_for_idle` on the client side, which would race with the daemon.
+    #[cfg(unix)]
+    pub fn unix_socket(path: &str) -> Result<Self> {
+        use std::os::unix::net::UnixStream;
+        let stream = UnixStream::connect(path)
+            .map_err(|e| format!("cannot connect to daemon socket {path}: {e}"))?;
+        let writer = stream.try_clone()?;
+        Ok(Self {
+            reader: MessageReader::new(stream),
+            writer: Box::new(writer),
+            timeout_ctrl: None,
+            _child: None,
         })
     }
 

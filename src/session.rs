@@ -214,6 +214,29 @@ impl LspSession {
         self.transport.set_read_timeout(Some(Duration::from_secs(60)));
     }
 
+    /// Notify the server that a file's content has changed.
+    ///
+    /// Use this instead of `did_open` when the file has already been opened in
+    /// this session and you want to sync an edit so diagnostics stay fresh.
+    pub fn did_change(&mut self, file_path: &str) -> Result<()> {
+        let text = std::fs::read_to_string(file_path)
+            .map_err(|e| format!("cannot read {file_path}: {e}"))?;
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {
+                    "uri":     file_uri(file_path),
+                    "version": 2,
+                },
+                "contentChanges": [{"text": text}],
+            }),
+        )?;
+        if self.transport.supports_timeout() {
+            self.wait_for_idle(Duration::from_secs(60));
+        }
+        Ok(())
+    }
+
     pub fn hover(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
         self.request("textDocument/hover", json!({
             "textDocument": {"uri": file_uri(file_path)},
