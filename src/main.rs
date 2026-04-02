@@ -7,14 +7,13 @@ mod transport;
 use clap::{Parser, Subcommand};
 use format::*;
 use session::LspSession;
-use session_file::SessionInfo;
+use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
 /// LSP client CLI — connects to a language server and queries it.
 ///
-/// Connects over TCP by default (with auto-start of kotlin-lsp if not running).
-/// Use --stdio to communicate via a persistent session daemon that owns the
-/// server process, paying the initialisation cost only once.
+/// Connects over TCP by default. Use `start` to launch a persistent daemon
+/// that pays the server startup cost only once; subsequent calls auto-connect.
 #[derive(Parser)]
 #[command(name = "lsp-client", version)]
 struct Cli {
@@ -30,21 +29,25 @@ struct Cli {
     #[arg(long, global = true)]
     root: Option<String>,
 
-    /// Language ID sent to the server in textDocument/didOpen
-    #[arg(long, default_value = "kotlin", global = true)]
-    language_id: String,
+    /// Language ID sent to the server in textDocument/didOpen (e.g. kotlin, swift, rust)
+    #[arg(long, global = true)]
+    language_id: Option<String>,
 
-    /// Server binary to launch (auto-start or stdio)
-    #[arg(long, default_value = "kotlin-lsp", global = true)]
-    server: String,
+    /// Server binary to launch (e.g. kotlin-lsp, sourcekit-lsp, rust-analyzer)
+    #[arg(long, global = true)]
+    server: Option<String>,
 
-    /// Use stdio transport: connect to (or auto-start) a session daemon
+    /// Force use of a session daemon even if none is auto-detected
     #[arg(long, global = true)]
     stdio: bool,
 
-    /// Do not pass --stdio to the server process (e.g. rust-analyzer uses stdio by default)
+    /// Do not pass --stdio to the server process (e.g. sourcekit-lsp uses stdio by default)
     #[arg(long, global = true)]
     no_server_stdio_flag: bool,
+
+    /// Maximum time to wait for a response (e.g. 10s, 2m). Default: no timeout.
+    #[arg(long, global = true, value_parser = parse_duration)]
+    timeout: Option<std::time::Duration>,
 
     /// Output raw LSP result as JSON
     #[arg(long, global = true)]
@@ -149,6 +152,9 @@ enum Command {
         idle_timeout: u64,
     },
 
+    /// Show status of the session daemon for this workspace.
+    Status,
+
     /// Stop the running LSP session daemon for this workspace.
     Stop,
 
@@ -176,6 +182,52 @@ fn main() {
                 Ok(()) => eprintln!("lsp-client daemon started for {root}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Command::Status => {
+            match SessionInfo::load(&root) {
+                Some(info) if info.is_alive() => {
+                    let uptime =
+                        format_uptime(unix_timestamp().saturating_sub(info.started_at));
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "status":      "running",
+                                "pid":         info.pid,
+                                "socket":      info.socket,
+                                "server":      info.server,
+                                "language_id": info.language_id,
+                                "workspace":   info.workspace,
+                                "uptime":      uptime,
+                            })
+                        );
+                    } else {
+                        println!("status:      running");
+                        println!("pid:         {}", info.pid);
+                        println!("socket:      {}", info.socket);
+                        println!("server:      {}", info.server);
+                        println!("language_id: {}", info.language_id);
+                        println!("uptime:      {uptime}");
+                    }
+                }
+                Some(_) => {
+                    if cli.json {
+                        println!("{}", serde_json::json!({"status": "dead"}));
+                    } else {
+                        eprintln!("status:      dead (stale session)");
+                    }
+                    std::process::exit(1);
+                }
+                None => {
+                    if cli.json {
+                        println!("{}", serde_json::json!({"status": "not running"}));
+                    } else {
+                        eprintln!("status:      not running");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -218,9 +270,17 @@ fn main() {
         Command::DaemonRun { idle_timeout } => {
             let server_args: &[&str] =
                 if cli.no_server_stdio_flag { &[] } else { &["--stdio"] };
-            if let Err(e) =
-                daemon::run_daemon(&root, &cli.server, server_args, *idle_timeout, cli.verbose)
-            {
+            let server = cli.server.as_deref().unwrap_or_else(|| {
+                eprintln!("Error: --server is required");
+                std::process::exit(1);
+            });
+            let language_id = cli.language_id.as_deref().unwrap_or_else(|| {
+                eprintln!("Error: --language-id is required");
+                std::process::exit(1);
+            });
+            if let Err(e) = daemon::run_daemon(
+                &root, server, server_args, *idle_timeout, cli.verbose, language_id,
+            ) {
                 eprintln!("daemon error: {e}");
                 std::process::exit(1);
             }
@@ -231,10 +291,19 @@ fn main() {
 
     // ---- Build transport ----------------------------------------------------
 
-    let transport = if cli.stdio {
+    // Load session info once — used for both auto-detect and language_id fallback.
+    let session_info = SessionInfo::load(&root);
+    let use_daemon =
+        cli.stdio || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false);
+
+    let transport = if use_daemon {
         connect_or_start_daemon(&cli, &root)
     } else {
-        Transport::tcp_with_autostart(&cli.host, cli.port, &cli.server, cli.verbose)
+        let server_bin = cli.server.as_deref().unwrap_or_else(|| {
+            eprintln!("Error: --server is required (no active daemon found for {root})");
+            std::process::exit(1);
+        });
+        Transport::tcp_with_autostart(&cli.host, cli.port, server_bin, cli.verbose)
     };
 
     let transport = match transport {
@@ -245,7 +314,19 @@ fn main() {
         }
     };
 
-    let mut session = LspSession::new(transport, cli.verbose);
+    if let Some(dur) = cli.timeout {
+        transport.set_read_timeout(Some(dur));
+    }
+
+    // Resolve language ID: explicit flag > session file > error.
+    let effective_language_id: String = cli.language_id.clone()
+        .or_else(|| session_info.as_ref().map(|i| i.language_id.clone()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| {
+            eprintln!("Error: --language-id is required (or start a daemon first with --language-id)");
+            std::process::exit(1);
+        });
+
+    let mut session = LspSession::new(transport, cli.verbose, cli.timeout);
 
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         let init_resp = session.initialize(&root)?;
@@ -271,12 +352,13 @@ fn main() {
                 Command::Capabilities => unreachable!(),
                 Command::WorkspaceSymbols { file: Some(f), .. } => f.clone(),
                 Command::WorkspaceSymbols { file: None, .. } => unreachable!(),
-                Command::Start { .. } | Command::Stop | Command::DaemonRun { .. } => {
-                    unreachable!()
-                }
+                Command::Start { .. }
+                | Command::Status
+                | Command::Stop
+                | Command::DaemonRun { .. } => unreachable!(),
             };
             let abs = abs_path(&file);
-            session.did_open(&abs, &cli.language_id)?;
+            session.did_open(&abs, &effective_language_id)?;
         }
 
         match &cli.command {
@@ -384,9 +466,10 @@ fn main() {
                     println!("{}", format_inlay_hints(&resp))
                 }
             }
-            Command::Start { .. } | Command::Stop | Command::DaemonRun { .. } => {
-                unreachable!()
-            }
+            Command::Start { .. }
+            | Command::Status
+            | Command::Stop
+            | Command::DaemonRun { .. } => unreachable!(),
         }
 
         Ok(())
@@ -444,8 +527,9 @@ fn connect_or_start_daemon(cli: &Cli, root: &str) -> transport::Result<Transport
 fn connect_or_start_daemon(cli: &Cli, root: &str) -> transport::Result<Transport> {
     let _ = root;
     // No Unix socket support — fall back to spawning directly.
+    let server = cli.server.as_deref().ok_or("--server is required")?;
     let args: &[&str] = if cli.no_server_stdio_flag { &[] } else { &["--stdio"] };
-    Transport::stdio(&cli.server, args)
+    Transport::stdio(server, args)
 }
 
 /// Spawn `lsp-client daemon-run` as a background process and block until the
@@ -457,12 +541,17 @@ fn start_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Stdio;
 
+    let server = cli.server.as_deref().ok_or("--server is required to start a daemon")?;
+    let language_id =
+        cli.language_id.as_deref().ok_or("--language-id is required to start a daemon")?;
+
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
 
     // Global flags must come before the subcommand.
     cmd.arg("--root").arg(root);
-    cmd.arg("--server").arg(&cli.server);
+    cmd.arg("--server").arg(server);
+    cmd.arg("--language-id").arg(language_id);
     if cli.no_server_stdio_flag {
         cmd.arg("--no-server-stdio-flag");
     }
@@ -537,6 +626,34 @@ fn abs_path(file: &str) -> String {
     std::fs::canonicalize(file)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| file.to_owned())
+}
+
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    if let Some(n) = s.strip_suffix('s') {
+        n.parse::<u64>().map(std::time::Duration::from_secs).map_err(|e| e.to_string())
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>()
+            .map(|m| std::time::Duration::from_secs(m * 60))
+            .map_err(|e| e.to_string())
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>()
+            .map(|h| std::time::Duration::from_secs(h * 3600))
+            .map_err(|e| e.to_string())
+    } else {
+        s.parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .map_err(|_| format!("invalid duration '{s}': use e.g. 10s, 2m, 1h"))
+    }
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn print_json(resp: &serde_json::Value) {

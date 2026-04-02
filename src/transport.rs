@@ -36,11 +36,11 @@ impl MessageReader {
             if let Some(msg) = self.try_parse()? {
                 return Ok(msg);
             }
-            // Blocking fill — will surface real errors and timeouts as errors
             match self.fill() {
-                Ok(_) => {}
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    return Err(e.into());
+                Ok(true) => {}
+                Ok(false) => {
+                    // fill() returns Ok(false) when SO_RCVTIMEO fires — surface it as an error
+                    return Err(io::Error::from(io::ErrorKind::TimedOut).into());
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -92,12 +92,32 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Allows setting a read timeout on the underlying socket.
+enum TimeoutCtrl {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl TimeoutCtrl {
+    fn set_read_timeout(&self, d: Option<Duration>) {
+        match self {
+            TimeoutCtrl::Tcp(s) => { let _ = s.set_read_timeout(d); }
+            #[cfg(unix)]
+            TimeoutCtrl::Unix(s) => { let _ = s.set_read_timeout(d); }
+        }
+    }
+
+    fn is_tcp(&self) -> bool {
+        matches!(self, TimeoutCtrl::Tcp(_))
+    }
+}
+
 /// Owns the transport I/O and optionally a child process (for stdio mode).
 pub struct Transport {
     pub reader: MessageReader,
     pub writer: Box<dyn Write>,
-    /// Kept solely for read-timeout control in TCP mode.
-    timeout_ctrl: Option<TcpStream>,
+    timeout_ctrl: Option<TimeoutCtrl>,
     _child: Option<Child>,
 }
 
@@ -158,7 +178,7 @@ impl Transport {
         Ok(Self {
             reader: MessageReader::new(stream),
             writer: Box::new(writer),
-            timeout_ctrl: Some(timeout_ctrl),
+            timeout_ctrl: Some(TimeoutCtrl::Tcp(timeout_ctrl)),
             _child: None,
         })
     }
@@ -195,33 +215,35 @@ impl Transport {
 
     /// Connect to a running lsp-client daemon over a Unix domain socket.
     ///
-    /// The daemon handles the initialize handshake and wait_for_idle internally,
-    /// so this transport deliberately does NOT support read timeouts
-    /// (`supports_timeout` returns false).  That keeps `LspSession` from calling
-    /// `wait_for_idle` on the client side, which would race with the daemon.
+    /// `supports_timeout()` returns false for Unix socket connections so that
+    /// `LspSession` does not call `wait_for_idle` on the client side (the daemon
+    /// handles idle detection internally).  However, an explicit `--timeout` flag
+    /// will still apply via `set_read_timeout` to cap hanging requests.
     #[cfg(unix)]
     pub fn unix_socket(path: &str) -> Result<Self> {
         use std::os::unix::net::UnixStream;
         let stream = UnixStream::connect(path)
             .map_err(|e| format!("cannot connect to daemon socket {path}: {e}"))?;
         let writer = stream.try_clone()?;
+        let timeout_ctrl = stream.try_clone()?;
         Ok(Self {
             reader: MessageReader::new(stream),
             writer: Box::new(writer),
-            timeout_ctrl: None,
+            timeout_ctrl: Some(TimeoutCtrl::Unix(timeout_ctrl)),
             _child: None,
         })
     }
 
     pub fn set_read_timeout(&self, d: Option<Duration>) {
-        if let Some(s) = &self.timeout_ctrl {
-            let _ = s.set_read_timeout(d);
+        if let Some(ctrl) = &self.timeout_ctrl {
+            ctrl.set_read_timeout(d);
         }
     }
 
-    /// Returns true if this transport supports read timeouts (TCP mode only).
+    /// Returns true if this transport should trigger wait_for_idle (TCP mode only).
+    /// Unix socket connections skip client-side idle detection; the daemon handles it.
     pub fn supports_timeout(&self) -> bool {
-        self.timeout_ctrl.is_some()
+        self.timeout_ctrl.as_ref().map(|c| c.is_tcp()).unwrap_or(false)
     }
 
     pub fn send_raw(&mut self, body: &str) -> Result<()> {

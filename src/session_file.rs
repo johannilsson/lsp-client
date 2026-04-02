@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub struct SessionInfo {
     pub workspace: String,
     pub server: String,
+    pub language_id: String,
     pub pid: u32,
     pub socket: String,
     pub started_at: u64, // Unix timestamp seconds
@@ -45,6 +46,7 @@ impl SessionInfo {
         Some(Self {
             workspace: v["workspace"].as_str()?.to_owned(),
             server: v["server"].as_str()?.to_owned(),
+            language_id: v["language_id"].as_str().unwrap_or("").to_owned(),
             pid: v["pid"].as_u64()? as u32,
             socket: v["socket"].as_str()?.to_owned(),
             started_at: v["started_at"].as_u64().unwrap_or(0),
@@ -60,6 +62,7 @@ impl SessionInfo {
         let v = json!({
             "workspace":   self.workspace,
             "server":      self.server,
+            "language_id": self.language_id,
             "pid":         self.pid,
             "socket":      self.socket,
             "started_at":  self.started_at,
@@ -74,8 +77,13 @@ impl SessionInfo {
 
     /// Returns true if the daemon process is still running.
     pub fn is_alive(&self) -> bool {
-        // /proc/<pid> exists on Linux for as long as the process is alive.
-        std::path::Path::new(&format!("/proc/{}", self.pid)).exists()
+        std::process::Command::new("kill")
+            .args(["-0", &self.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 

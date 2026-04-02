@@ -104,6 +104,7 @@ impl DaemonCore {
     fn wait_for_idle(&mut self) {
         let mut pending: HashSet<Value> = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last_activity = Instant::now();
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -113,6 +114,7 @@ impl DaemonCore {
             let timeout = remaining.min(Duration::from_millis(500));
             match self.server_rx.recv_timeout(timeout) {
                 Ok(msg) => {
+                    last_activity = Instant::now();
                     let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
                     match method {
                         "window/workDoneProgress/create" => {
@@ -159,8 +161,9 @@ impl DaemonCore {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if pending.is_empty() {
-                        // Server is quiet and no work tokens are outstanding.
+                    // Break if server is quiet with no outstanding tokens, OR if tokens
+                    // exist but the server has gone silent (server forgot to send "end").
+                    if pending.is_empty() || last_activity.elapsed() >= Duration::from_secs(2) {
                         break;
                     }
                 }
@@ -309,6 +312,7 @@ pub fn run_daemon(
     server_args: &[&str],
     idle_secs: u64,
     verbose: bool,
+    language_id: &str,
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
@@ -430,6 +434,7 @@ pub fn run_daemon(
     let info = SessionInfo {
         workspace: canonical_root.clone(),
         server: server_bin.to_owned(),
+        language_id: language_id.to_owned(),
         pid: std::process::id(),
         socket: socket_path.clone(),
         started_at: unix_timestamp(),
@@ -450,6 +455,10 @@ pub fn run_daemon(
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                // The listener is non-blocking (for the idle-timeout loop), but accepted
+                // sockets inherit that flag on Unix.  Set back to blocking so that
+                // read_message() in handle_connection works correctly.
+                let _ = stream.set_nonblocking(false);
                 last_activity = Instant::now();
                 if verbose {
                     eprintln!("[DAEMON] client connected");

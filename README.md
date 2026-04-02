@@ -2,12 +2,9 @@
 
 A minimal CLI for querying a Language Server Protocol (LSP) server. Designed to be called by AI applications that need language intelligence (hover, definitions, references, diagnostics, completions) without bundling their own LSP client.
 
-Defaults to Kotlin via [kotlin-lsp](https://github.com/Kotlin/kotlin-lsp). TCP auto-start is kotlin-lsp specific; for other servers use `--stdio` or connect to a manually started server.
-
 ## Install
 
 ```sh
-brew install JetBrains/utils/kotlin-lsp
 cargo install --path .
 ```
 
@@ -29,19 +26,30 @@ Commands:
   rename             <file> <line> <col> <new-name>
   semantic-tokens    <file>
   inlay-hints        <file> [--start-line N] [--end-line N]
+  start              Start a persistent daemon for this workspace
+  status             Show daemon status (PID, socket, uptime)
+  stop               Stop the daemon
 ```
 
 Line and column numbers are 1-based.
 
+## Daemon workflow (recommended)
+
+Start a daemon once per workspace. Subsequent calls auto-connect.
+
 ```sh
-# Human-readable output
-lsp-client --root /my/project hover src/Main.kt 42 10
+# Start daemon
+lsp-client start --server <binary> --language-id <id> [--root /path/to/project]
 
-# JSON output (for programmatic use)
-lsp-client --root /my/project --json diagnostics src/Main.kt
+# Query (auto-connects to daemon; --root defaults to cwd)
+lsp-client symbols src/Foo.kt
+lsp-client hover src/Foo.kt 42 10
 
-# stdio transport (spawns server as child process)
-lsp-client --stdio hover src/Main.kt 42 10
+# Check status
+lsp-client status
+
+# Stop
+lsp-client stop
 ```
 
 ## Options
@@ -49,19 +57,55 @@ lsp-client --stdio hover src/Main.kt 42 10
 | Flag | Default | Description |
 |---|---|---|
 | `--root` | cwd | Project root directory |
+| `--server` | — | Server binary to launch (required without a running daemon) |
+| `--language-id` | — | Language ID for `didOpen` (required without a running daemon) |
+| `--timeout` | — | Max time to wait for a response (e.g. `10s`, `2m`) |
 | `--host` | `127.0.0.1` | Server host (TCP mode) |
 | `--port` | `9999` | Server port (TCP mode) |
-| `--server` | `kotlin-lsp` | Server binary to launch |
-| `--language-id` | `kotlin` | Language ID for `didOpen` |
-| `--stdio` | — | Spawn server over stdio instead of TCP |
+| `--no-server-stdio-flag` | — | Don't pass `--stdio` to the server process |
 | `--json` | — | Emit `{"ok": true, "result": ...}` JSON |
 | `--verbose` / `-v` | — | Debug logging to stderr |
 
+## Server-specific setup
+
+### kotlin-lsp (Kotlin, TCP mode)
+
+kotlin-lsp runs as a persistent TCP server, so daemon mode is optional — it auto-starts on the first call.
+
+```sh
+brew install JetBrains/utils/kotlin-lsp
+
+# One-shot (auto-starts server on first call)
+lsp-client --server kotlin-lsp --language-id kotlin --root /my/project symbols src/Main.kt
+
+# Or with daemon
+lsp-client start --server kotlin-lsp --language-id kotlin --root /my/project
+lsp-client symbols src/Main.kt
+```
+
+### sourcekit-lsp (Swift)
+
+sourcekit-lsp communicates over stdio and starts fresh per invocation, so the daemon is strongly recommended to avoid paying the startup cost on every call.
+
+```sh
+# sourcekit-lsp uses stdio by default — don't pass --stdio to the process
+lsp-client start --server sourcekit-lsp --no-server-stdio-flag --language-id swift --root /my/project
+lsp-client symbols Sources/App.swift
+lsp-client --timeout 15s hover Sources/App.swift 10 5
+```
+
+### rust-analyzer
+
+```sh
+lsp-client start --server rust-analyzer --no-server-stdio-flag --language-id rust --root /my/project
+lsp-client diagnostics src/main.rs
+```
+
 ## How it works
 
-By default the client connects to a running `kotlin-lsp` server over TCP (`--multi-client` mode). If no server is running it starts one automatically and waits for it to be ready. The warm server is then reused across subsequent calls, keeping latency low.
+Query commands auto-detect a running daemon for the project root. If a daemon is running, the client connects to it over a Unix socket — no flags needed. If no daemon is found, the client falls back to TCP (requires `--server`).
 
-Use `--stdio` to skip the shared server and spawn a fresh process per call — simpler but slower due to JVM startup time.
+The daemon pays the LSP server startup and indexing cost once, then serves all subsequent calls from the warm session.
 
 ## Known limitations
 

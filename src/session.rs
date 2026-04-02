@@ -8,6 +8,7 @@ pub struct LspSession {
     transport: Transport,
     next_id: u64,
     verbose: bool,
+    timeout: Option<Duration>,
 }
 
 fn file_uri(path: &str) -> String {
@@ -16,8 +17,8 @@ fn file_uri(path: &str) -> String {
 }
 
 impl LspSession {
-    pub fn new(transport: Transport, verbose: bool) -> Self {
-        Self { transport, next_id: 1, verbose }
+    pub fn new(transport: Transport, verbose: bool, timeout: Option<Duration>) -> Self {
+        Self { transport, next_id: 1, verbose, timeout }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -135,7 +136,8 @@ impl LspSession {
         // Wait for server to finish indexing before we query.
         // Only possible in TCP mode — stdio transport doesn't support read timeouts.
         if self.transport.supports_timeout() {
-            self.wait_for_idle(Duration::from_secs(60));
+            let max_wait = self.timeout.unwrap_or(Duration::from_secs(60));
+            self.wait_for_idle(max_wait);
         }
         Ok(())
     }
@@ -148,6 +150,7 @@ impl LspSession {
     fn wait_for_idle(&mut self, max_wait: Duration) {
         let mut pending: HashSet<serde_json::Value> = HashSet::new();
         let deadline = Instant::now() + max_wait;
+        let mut last_activity = Instant::now();
 
         // Use a short read timeout so we can detect when the server goes quiet.
         self.transport.set_read_timeout(Some(Duration::from_millis(500)));
@@ -159,6 +162,7 @@ impl LspSession {
 
             match self.transport.reader.try_read_message() {
                 Ok(Some(msg)) => {
+                    last_activity = Instant::now();
                     let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
                     // Ack any server-initiated requests (e.g. window/workDoneProgress/create)
@@ -201,17 +205,17 @@ impl LspSession {
                 }
                 // Timeout — no message arrived within 500ms
                 Ok(None) | Err(_) => {
-                    if pending.is_empty() {
-                        // Server is quiet and nothing is pending — we're ready
+                    // Break if server is quiet with no outstanding tokens, OR if tokens
+                    // exist but the server has gone silent (server forgot to send "end").
+                    if pending.is_empty() || last_activity.elapsed() >= Duration::from_secs(2) {
                         break;
                     }
-                    // Still waiting on progress tokens — keep going
                 }
             }
         }
 
-        // Restore the normal read timeout
-        self.transport.set_read_timeout(Some(Duration::from_secs(60)));
+        // Restore the configured read timeout
+        self.transport.set_read_timeout(self.timeout.or(Some(Duration::from_secs(60))));
     }
 
 
