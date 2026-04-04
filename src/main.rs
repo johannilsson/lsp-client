@@ -244,6 +244,13 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         .or_else(|| file_config.root.clone())
         .or(config_dir)
         .unwrap_or(cwd);
+    // Canonicalize so the CLI and the daemon always hash the same string.
+    // Without this, symlinked paths (common with git worktrees) produce a
+    // different hash than the canonical path the daemon stores, causing the
+    // CLI to fail to find a running daemon.
+    let root = std::fs::canonicalize(&root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(root);
 
     let timeout = cli.timeout.or_else(|| {
         file_config
