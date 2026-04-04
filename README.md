@@ -82,19 +82,20 @@ lsp-client session stop
 
 ## Server-specific setup
 
-### kotlin-lsp (Kotlin, TCP mode)
-
-kotlin-lsp runs as a persistent TCP server, so daemon mode is optional — it auto-starts on the first call.
+### kotlin-lsp (Kotlin)
 
 ```sh
 brew install JetBrains/utils/kotlin-lsp
 
-# One-shot (auto-starts server on first call)
-lsp-client --server kotlin-lsp --language-id kotlin --root /my/project query symbols src/Main.kt
-
-# Or with daemon
+# Recommended: daemon over stdio (starts once, serves all subsequent calls from a warm session)
 lsp-client session start --server kotlin-lsp --language-id kotlin --root /my/project
 lsp-client query symbols src/Main.kt
+
+# Direct TCP: attach to a server already running on port 9999 (e.g. started by IntelliJ)
+lsp-client --tcp --language-id kotlin --root /my/project query symbols src/Main.kt
+
+# Direct TCP with auto-start: spawn kotlin-lsp over TCP if none is listening
+lsp-client --tcp --server kotlin-lsp --language-id kotlin --root /my/project query symbols src/Main.kt
 ```
 
 ### sourcekit-lsp (Swift)
@@ -117,9 +118,9 @@ lsp-client query diagnostics src/main.rs
 
 ## How it works
 
-Query commands auto-detect a running daemon for the project root. If a daemon is running, the client connects to it over a Unix socket — no flags needed. If no daemon is found, the client falls back to TCP (requires `--server`).
+Query commands auto-detect a running daemon for the project root. If a daemon is running, the client connects to it over a Unix socket — no flags needed. The daemon starts the language server once over stdio, pays the startup and indexing cost once, then serves all subsequent calls from the warm session.
 
-The daemon pays the LSP server startup and indexing cost once, then serves all subsequent calls from the warm session.
+Pass `--tcp` to bypass the daemon entirely and connect directly to a TCP language server (e.g. kotlin-lsp on port 9999). This is useful when a server is already running — for example, started by an IDE — and you want to share it. Add `--server <binary>` to auto-start the server if none is listening.
 
 ## Known limitations
 

@@ -48,6 +48,12 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     stdio: bool,
 
+    /// Connect directly over TCP, bypassing the daemon. Uses --host / --port.
+    /// Useful for attaching to a server already started by an IDE (e.g. kotlin-lsp).
+    /// When combined with --server, auto-starts the server if none is listening.
+    #[arg(long, global = true)]
+    tcp: bool,
+
     /// Do not pass --stdio to the server process (e.g. sourcekit-lsp uses stdio by default)
     #[arg(long, global = true)]
     no_server_stdio_flag: bool,
@@ -409,8 +415,9 @@ fn main() {
     //   - explicitly requested (--daemon / deprecated --stdio)
     //   - a live daemon is already running for this root
     //   - a server binary is configured (auto-start)
-    // …but not when we're doing a direct capabilities probe.
+    // …but not when we're doing a direct capabilities probe or --tcp is set.
     let use_daemon = !caps_direct
+        && !cli.tcp
         && (cli.daemon
             || cli.stdio
             || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false)
@@ -418,18 +425,18 @@ fn main() {
 
     let transport = if use_daemon {
         connect_or_start_daemon(&effective, cli.verbose, 300)
-    } else {
+    } else if caps_direct {
+        // Spawn the server directly over stdio for capabilities introspection.
         let server_bin = effective.server.as_deref().unwrap_or_else(|| {
-            eprintln!("Error: --server is required (no active daemon found for {root})");
+            eprintln!("Error: --server is required for capabilities probing");
             std::process::exit(1);
         });
-        if caps_direct {
-            // Spawn the server directly over stdio for capabilities introspection.
-            let args: &[&str] = if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
-            Transport::stdio(server_bin, args)
-        } else {
-            Transport::tcp_with_autostart(&cli.host, cli.port, server_bin, cli.verbose)
-        }
+        let args: &[&str] = if effective.no_server_stdio_flag { &[] } else { &["--stdio"] };
+        Transport::stdio(server_bin, args)
+    } else {
+        // --tcp mode: connect directly over TCP, bypassing the daemon.
+        // server_bin is optional — if provided and connection is refused, auto-starts the server.
+        Transport::tcp_with_autostart(&cli.host, cli.port, effective.server.as_deref(), cli.verbose)
     };
 
     let transport = match transport {
