@@ -133,7 +133,7 @@ impl Transport {
         verbose: bool,
     ) -> Result<Self> {
         match TcpStream::connect((host, port)) {
-            Ok(stream) => return Ok(Self::from_tcp(stream)?),
+            Ok(stream) => Self::from_tcp(stream),
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                 let Some(bin) = server_bin else {
                     return Err(format!(
@@ -166,7 +166,7 @@ impl Transport {
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
                     match TcpStream::connect((host, port)) {
-                        Ok(stream) => return Ok(Self::from_tcp(stream)?),
+                        Ok(stream) => return Self::from_tcp(stream),
                         Err(_) if Instant::now() < deadline => continue,
                         Err(_) => {
                             return Err(format!(
@@ -177,7 +177,7 @@ impl Transport {
                     }
                 }
             }
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => Err(Box::new(e)),
         }
     }
 

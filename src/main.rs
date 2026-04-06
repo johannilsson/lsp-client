@@ -292,8 +292,8 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                if *wait {
-                    if let Some(info) = SessionInfo::load(root) {
+                if *wait
+                    && let Some(info) = SessionInfo::load(root) {
                         let lang = effective
                             .language_id
                             .as_deref()
@@ -310,7 +310,6 @@ fn main() {
                             eprintln!("lsp-client daemon ready (indexing complete) for {root}");
                         }
                     }
-                }
                 return;
             }
             SessionCommand::Status => {

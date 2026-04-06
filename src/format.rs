@@ -150,7 +150,7 @@ pub fn format_definition(resp: &Value) -> String {
     "No definition found.".into()
 }
 
-fn dedup_locations<'a>(locs: &'a [Value]) -> Vec<&'a Value> {
+fn dedup_locations(locs: &[Value]) -> Vec<&Value> {
     let mut seen = HashSet::new();
     locs.iter()
         .filter(|loc| {
@@ -277,8 +277,8 @@ pub fn format_signature_help(resp: &Value) -> String {
         let label = sig["label"].as_str().unwrap_or("?");
         let marker = if i == active_sig { "▶ " } else { "  " };
         let mut out = format!("{marker}{label}");
-        if i == active_sig {
-            if let Some(params) = sig.get("parameters").and_then(|v| v.as_array()) {
+        if i == active_sig
+            && let Some(params) = sig.get("parameters").and_then(|v| v.as_array()) {
                 let idx = active_param
                     .or_else(|| sig.get("activeParameter").and_then(|v| v.as_u64()))
                     .unwrap_or(0) as usize;
@@ -298,7 +298,6 @@ pub fn format_signature_help(resp: &Value) -> String {
                     }
                 }
             }
-        }
         if let Some(doc) = sig.get("documentation") {
             let text = doc.get("value").and_then(|v| v.as_str())
                 .or_else(|| doc.as_str())
@@ -391,7 +390,7 @@ pub fn format_semantic_tokens(resp: &Value) -> String {
     }
 
     let nums: Vec<u64> = data.iter().filter_map(|v| v.as_u64()).collect();
-    if nums.len() % 5 != 0 {
+    if !nums.len().is_multiple_of(5) {
         return format!("Unexpected token data length: {}", nums.len());
     }
 
@@ -490,8 +489,8 @@ pub fn format_context(hover: &Value, definition: &Value, references: &Value, dia
     }
 
     // References
-    if let Some(result) = references.get("result").filter(|v| !v.is_null()) {
-        if let Some(arr) = result.as_array().filter(|a| !a.is_empty()) {
+    if let Some(result) = references.get("result").filter(|v| !v.is_null())
+        && let Some(arr) = result.as_array().filter(|a| !a.is_empty()) {
             let deduped = dedup_locations(arr);
             let total = deduped.len();
             let cap = total.min(12);
@@ -505,7 +504,6 @@ pub fn format_context(hover: &Value, definition: &Value, references: &Value, dia
                 out.push_str(&format!("... and {} more\n", total - 12));
             }
         }
-    }
 
     // Diagnostics
     let diag_text = match diagnostics.get("result").filter(|v| !v.is_null()) {

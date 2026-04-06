@@ -1,22 +1,22 @@
-/// Long-lived daemon that owns the stdio pipes to an LSP server and exposes a
-/// Unix domain socket for short-lived CLI invocations to connect to.
-///
-/// Architecture:
-///
-///   lsp-client hover ...
-///         ↓ unix socket
-///     lsp-client daemon         ← this module, long-lived
-///         ↓ stdio pipes
-///     rust-analyzer / ...
-///
-/// The daemon performs the initialize/initialized handshake once and caches
-/// the server's capabilities.  Each CLI invocation connects to the socket,
-/// receives the cached init response, makes its LSP calls, and disconnects —
-/// the server process never sees the disconnect.
-///
-/// Request handling is sequential: the daemon handles one socket client at a
-/// time.  This is correct for LSP (which is already sequential in practice)
-/// and avoids needing an async runtime.
+//! Long-lived daemon that owns the stdio pipes to an LSP server and exposes a
+//! Unix domain socket for short-lived CLI invocations to connect to.
+//!
+//! Architecture:
+//!
+//!   lsp-client hover ...
+//!         ↓ unix socket
+//!     lsp-client daemon         ← this module, long-lived
+//!         ↓ stdio pipes
+//!     rust-analyzer / ...
+//!
+//! The daemon performs the initialize/initialized handshake once and caches
+//! the server's capabilities.  Each CLI invocation connects to the socket,
+//! receives the cached init response, makes its LSP calls, and disconnects —
+//! the server process never sees the disconnect.
+//!
+//! Request handling is sequential: the daemon handles one socket client at a
+//! time.  This is correct for LSP (which is already sequential in practice)
+//! and avoids needing an async runtime.
 
 use crate::session_file::{unix_timestamp, SessionInfo};
 use crate::transport::MessageReader;
@@ -208,11 +208,10 @@ fn handle_connection(
         let method = msg.get("method").and_then(|v| v.as_str());
         let has_id = msg.get("id").is_some();
 
-        if core.verbose {
-            if let Some(m) = method {
+        if core.verbose
+            && let Some(m) = method {
                 eprintln!("[DAEMON] client >>> {m}");
             }
-        }
 
         match method {
             // ------------------------------------------------------------------
@@ -389,14 +388,9 @@ pub fn run_daemon(
     let (tx, rx) = mpsc::channel::<Value>();
     std::thread::spawn(move || {
         let mut reader = MessageReader::new(server_stdout);
-        loop {
-            match reader.read_message() {
-                Ok(msg) => {
-                    if tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(msg) = reader.read_message() {
+            if tx.send(msg).is_err() {
+                break;
             }
         }
     });
