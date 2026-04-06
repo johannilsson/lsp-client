@@ -122,51 +122,62 @@ pub struct Transport {
 
 impl Transport {
     /// Connect to a running server over TCP, auto-starting it if not available.
+    ///
+    /// `server_bin` is optional. If `None` and the connection is refused, an error is
+    /// returned immediately. If `Some`, the server is spawned with `--socket host:port
+    /// --multi-client` and the client polls until it becomes ready (up to 30 s).
     pub fn tcp_with_autostart(
         host: &str,
         port: u16,
-        server_bin: &str,
+        server_bin: Option<&str>,
         verbose: bool,
     ) -> Result<Self> {
         match TcpStream::connect((host, port)) {
             Ok(stream) => return Ok(Self::from_tcp(stream)?),
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                let Some(bin) = server_bin else {
+                    return Err(format!(
+                        "No server listening on {host}:{port}. \
+                         Pass --server <binary> to auto-start one."
+                    )
+                    .into());
+                };
                 if verbose {
-                    eprintln!("[DEBUG] Connection refused, starting {server_bin}...");
+                    eprintln!("[DEBUG] Connection refused, starting {bin}...");
                 }
                 eprintln!("kotlin-lsp server not running — starting it...");
+
+                Command::new(bin)
+                    .args(["--socket", &format!("{host}:{port}"), "--multi-client"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| {
+                        if e.kind() == io::ErrorKind::NotFound {
+                            format!(
+                                "Error: '{bin}' not found. Install it with:\n  brew install JetBrains/utils/kotlin-lsp"
+                            )
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
+
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    match TcpStream::connect((host, port)) {
+                        Ok(stream) => return Ok(Self::from_tcp(stream)?),
+                        Err(_) if Instant::now() < deadline => continue,
+                        Err(_) => {
+                            return Err(format!(
+                                "{bin} did not become ready on {host}:{port} within 30s"
+                            )
+                            .into())
+                        }
+                    }
+                }
             }
             Err(e) => return Err(Box::new(e)),
-        }
-
-        Command::new(server_bin)
-            .args(["--socket", &format!("{host}:{port}"), "--multi-client"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    format!(
-                        "Error: '{server_bin}' not found. Install it with:\n  brew install JetBrains/utils/kotlin-lsp"
-                    )
-                } else {
-                    e.to_string()
-                }
-            })?;
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            std::thread::sleep(Duration::from_secs(2));
-            match TcpStream::connect((host, port)) {
-                Ok(stream) => return Ok(Self::from_tcp(stream)?),
-                Err(_) if Instant::now() < deadline => continue,
-                Err(_) => {
-                    return Err(format!(
-                        "kotlin-lsp did not become ready on {host}:{port} within 30s"
-                    )
-                    .into())
-                }
-            }
         }
     }
 
