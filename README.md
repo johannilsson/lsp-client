@@ -116,6 +116,22 @@ lsp-client session start --server rust-analyzer --no-server-stdio-flag --languag
 lsp-client query diagnostics src/main.rs
 ```
 
+## Testing
+
+The integration tests run against a small fixture Rust project using rust-analyzer. Install rust-analyzer first if needed:
+
+```sh
+rustup component add rust-analyzer
+```
+
+Then run the tests serially (the daemon handles one connection at a time):
+
+```sh
+cargo test --test integration -- --test-threads=1
+```
+
+The first run starts a daemon for the fixture project and warms it up; subsequent runs reuse it. The daemon shuts itself down after 5 minutes of inactivity.
+
 ## How it works
 
 Query commands auto-detect a running daemon for the project root. If a daemon is running, the client connects to it over a Unix socket — no flags needed. The daemon starts the language server once over stdio, pays the startup and indexing cost once, then serves all subsequent calls from the warm session.
