@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashSet;
 
 fn uri_to_path(uri: &str) -> &str {
     uri.strip_prefix("file://").unwrap_or(uri)
@@ -149,6 +150,20 @@ pub fn format_definition(resp: &Value) -> String {
     "No definition found.".into()
 }
 
+fn dedup_locations<'a>(locs: &'a [Value]) -> Vec<&'a Value> {
+    let mut seen = HashSet::new();
+    locs.iter()
+        .filter(|loc| {
+            let key = (
+                loc["uri"].as_str().unwrap_or("").to_string(),
+                loc["range"]["start"]["line"].as_u64().unwrap_or(0),
+                loc["range"]["start"]["character"].as_u64().unwrap_or(0),
+            );
+            seen.insert(key)
+        })
+        .collect()
+}
+
 pub fn format_references(resp: &Value) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No references found.".into();
@@ -159,7 +174,7 @@ pub fn format_references(resp: &Value) -> String {
     if arr.is_empty() {
         return "No references found.".into();
     }
-    arr.iter().map(format_location).collect::<Vec<_>>().join("\n")
+    dedup_locations(arr).into_iter().map(format_location).collect::<Vec<_>>().join("\n")
 }
 
 pub fn format_symbols(resp: &Value) -> String {
@@ -440,6 +455,78 @@ fn completion_kind(kind: u64) -> &'static str {
         9 => "Module", 10 => "Property", 13 => "Enum", 14 => "Keyword",
         15 => "Snippet", 25 => "TypeParam", _ => "",
     }
+}
+
+pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value) -> String {
+    let mut out = String::new();
+
+    // Hover
+    let hover_text = match hover.get("result").filter(|v| !v.is_null()) {
+        Some(_) => {
+            let s = format_hover(hover);
+            if s == "No hover information found." { None } else { Some(s) }
+        }
+        None => None,
+    };
+    if let Some(text) = hover_text {
+        out.push_str("## Hover\n");
+        out.push_str(&text);
+        out.push('\n');
+    }
+
+    // Definition
+    let def_text = match definition.get("result").filter(|v| !v.is_null()) {
+        Some(_) => {
+            let s = format_definition(definition);
+            if s == "No definition found." { None } else { Some(s) }
+        }
+        None => None,
+    };
+    if let Some(text) = def_text {
+        if !out.is_empty() { out.push('\n'); }
+        out.push_str("## Definition\n");
+        out.push_str(&text);
+        out.push('\n');
+    }
+
+    // References
+    if let Some(result) = references.get("result").filter(|v| !v.is_null()) {
+        if let Some(arr) = result.as_array().filter(|a| !a.is_empty()) {
+            let deduped = dedup_locations(arr);
+            let total = deduped.len();
+            let cap = total.min(12);
+            if !out.is_empty() { out.push('\n'); }
+            out.push_str(&format!("## References ({})\n", total));
+            for loc in &deduped[..cap] {
+                out.push_str(&format_location(loc));
+                out.push('\n');
+            }
+            if total > 12 {
+                out.push_str(&format!("... and {} more\n", total - 12));
+            }
+        }
+    }
+
+    // Diagnostics
+    let diag_text = match diagnostics.get("result").filter(|v| !v.is_null()) {
+        Some(_) => {
+            let s = format_diagnostics(diagnostics);
+            if s == "No diagnostics." { None } else { Some(s) }
+        }
+        None => None,
+    };
+    if let Some(text) = diag_text {
+        if !out.is_empty() { out.push('\n'); }
+        out.push_str("## Diagnostics\n");
+        out.push_str(&text);
+        out.push('\n');
+    }
+
+    if out.is_empty() {
+        out.push_str("No information available.\n");
+    }
+    out.push_str("---\n");
+    out
 }
 
 pub fn format_completion(resp: &Value) -> String {

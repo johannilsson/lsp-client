@@ -162,6 +162,14 @@ enum QueryCommand {
         #[arg(long)]
         end_line: Option<u32>,
     },
+    /// Combined hover + definition + references + diagnostics for AI context
+    Context {
+        file: String,
+        /// Line number (1-based)
+        line: u32,
+        /// Column number (1-based)
+        col: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +244,13 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         .or_else(|| file_config.root.clone())
         .or(config_dir)
         .unwrap_or(cwd);
+    // Canonicalize so the CLI and the daemon always hash the same string.
+    // Without this, symlinked paths (common with git worktrees) produce a
+    // different hash than the canonical path the daemon stores, causing the
+    // CLI to fail to find a running daemon.
+    let root = std::fs::canonicalize(&root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(root);
 
     let timeout = cli.timeout.or_else(|| {
         file_config
@@ -526,7 +541,8 @@ fn main() {
                     | QueryCommand::CodeAction { file, .. }
                     | QueryCommand::Rename { file, .. }
                     | QueryCommand::SemanticTokens { file }
-                    | QueryCommand::InlayHints { file, .. } => file.clone(),
+                    | QueryCommand::InlayHints { file, .. }
+                    | QueryCommand::Context { file, .. } => file.clone(),
                     QueryCommand::WorkspaceSymbols { file: Some(f), .. } => f.clone(),
                     QueryCommand::WorkspaceSymbols { file: None, .. } => unreachable!(),
                 },
@@ -536,7 +552,7 @@ fn main() {
             // Temporarily override timeout for did_open if --wait-for-index is set.
             let saved_timeout = session.timeout;
             session.timeout = did_open_timeout;
-            session.did_open(&abs, &effective_language_id)?;
+            session.ensure_current(&abs, &effective_language_id)?;
             session.timeout = saved_timeout;
             // wait_for_idle (called inside did_open) sets transport timeout to
             // session.timeout; restore to the original configured value.
@@ -672,6 +688,25 @@ fn main() {
                         print_json(&resp)
                     } else {
                         println!("{}", format_inlay_hints(&resp))
+                    }
+                }
+                QueryCommand::Context { file, line, col } => {
+                    let abs = abs_path(file);
+                    let line0 = line - 1;
+                    let col0 = col - 1;
+                    let hover = session.hover(&abs, line0, col0).unwrap_or(serde_json::Value::Null);
+                    let def = session.definition(&abs, line0, col0).unwrap_or(serde_json::Value::Null);
+                    let refs = session.references(&abs, line0, col0).unwrap_or(serde_json::Value::Null);
+                    let diag = session.diagnostics(&abs).unwrap_or(serde_json::Value::Null);
+                    if cli.json {
+                        println!("{}", serde_json::json!({
+                            "hover": hover,
+                            "definition": def,
+                            "references": refs,
+                            "diagnostics": diag,
+                        }));
+                    } else {
+                        print!("{}", format_context(&hover, &def, &refs, &diag));
                     }
                 }
             },

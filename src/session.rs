@@ -1,8 +1,8 @@
 use crate::transport::{Result, Transport};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IdleResult {
@@ -21,6 +21,10 @@ pub struct LspSession {
     pub timeout: Option<Duration>,
     /// Result of the most recent `wait_for_idle` call (None in daemon mode).
     pub last_idle_result: Option<IdleResult>,
+    /// Tracks URIs that have been opened and their current document version.
+    opened_versions: HashMap<String, u32>,
+    /// Tracks the mtime at which each URI was last sent to the server.
+    opened_mtimes: HashMap<String, SystemTime>,
 }
 
 fn file_uri(path: &str) -> String {
@@ -30,7 +34,15 @@ fn file_uri(path: &str) -> String {
 
 impl LspSession {
     pub fn new(transport: Transport, verbose: bool, timeout: Option<Duration>) -> Self {
-        Self { transport, next_id: 1, verbose, timeout, last_idle_result: None }
+        Self {
+            transport,
+            next_id: 1,
+            verbose,
+            timeout,
+            last_idle_result: None,
+            opened_versions: HashMap::new(),
+            opened_mtimes: HashMap::new(),
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -137,20 +149,68 @@ impl LspSession {
     pub fn did_open(&mut self, file_path: &str, language_id: &str) -> Result<()> {
         let text = std::fs::read_to_string(file_path)
             .map_err(|e| format!("cannot read {file_path}: {e}"))?;
+        let uri = file_uri(file_path);
+        let mtime = std::fs::metadata(file_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         self.notify("textDocument/didOpen", json!({
             "textDocument": {
-                "uri": file_uri(file_path),
+                "uri": uri,
                 "languageId": language_id,
                 "version": 1,
                 "text": text,
             }
         }))?;
+        self.opened_versions.insert(uri.clone(), 1);
+        self.opened_mtimes.insert(uri, mtime);
         // Wait for server to finish indexing before we query.
         // Only possible in TCP mode — Unix socket (daemon mode) handles this server-side.
         if self.transport.supports_timeout() {
             let max_wait = self.timeout.unwrap_or(Duration::from_secs(60));
             let result = self.wait_for_idle(max_wait);
             self.last_idle_result = Some(result);
+        }
+        Ok(())
+    }
+
+    /// Send a full-document `textDocument/didChange` for `file_path`.
+    /// The URI must have been previously opened with `did_open`.
+    pub fn did_change(&mut self, file_path: &str) -> Result<()> {
+        let uri = file_uri(file_path);
+        let Some(version) = self.opened_versions.get_mut(&uri) else {
+            return Ok(()); // file was never opened; caller should use did_open
+        };
+        let text = std::fs::read_to_string(file_path)
+            .map_err(|e| format!("cannot read {file_path}: {e}"))?;
+        let mtime = std::fs::metadata(file_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        *version += 1;
+        let new_version = *version;
+        self.opened_mtimes.insert(uri.clone(), mtime);
+        self.notify("textDocument/didChange", json!({
+            "textDocument": {"uri": uri, "version": new_version},
+            "contentChanges": [{"text": text}],
+        }))
+    }
+
+    /// Ensure the server has the current content of `file_path`.
+    /// Opens the file if not yet seen; sends `didChange` if the file has been
+    /// modified on disk since it was last sent.
+    pub fn ensure_current(&mut self, file_path: &str, language_id: &str) -> Result<()> {
+        let uri = file_uri(file_path);
+        if !self.opened_versions.contains_key(&uri) {
+            return self.did_open(file_path, language_id);
+        }
+        let current_mtime = std::fs::metadata(file_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let stored_mtime = self.opened_mtimes.get(&uri).copied().unwrap_or(SystemTime::UNIX_EPOCH);
+        if current_mtime > stored_mtime {
+            if self.verbose {
+                eprintln!("[DEBUG] file modified since last open, sending didChange: {file_path}");
+            }
+            self.did_change(file_path)?;
         }
         Ok(())
     }

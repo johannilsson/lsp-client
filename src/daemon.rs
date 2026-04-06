@@ -21,7 +21,7 @@
 use crate::session_file::{unix_timestamp, SessionInfo};
 use crate::transport::MessageReader;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
@@ -52,6 +52,10 @@ struct DaemonCore {
     server_rx: Receiver<Value>,
     next_id: u64,
     verbose: bool,
+    /// Tracks URIs the server has opened and their current document version.
+    /// Used to convert a repeat textDocument/didOpen into textDocument/didChange
+    /// so the server sees updated content without a protocol violation.
+    opened_versions: HashMap<String, u32>,
 }
 
 impl DaemonCore {
@@ -253,7 +257,47 @@ fn handle_connection(
             // Notifications (no id): forward to server, wait for it to settle.
             // ------------------------------------------------------------------
             Some(_) if !has_id => {
-                if let Err(e) = core.send_raw(&msg) {
+                // Convert a repeat textDocument/didOpen into textDocument/didChange.
+                // Each CLI invocation sends didOpen with current file content, but
+                // the LSP spec forbids opening a document that is already open.
+                // By rewriting to didChange after the first open, the server sees
+                // correct content updates without a protocol violation.
+                let forwarded = if msg.get("method").and_then(|v| v.as_str())
+                    == Some("textDocument/didOpen")
+                {
+                    let uri = msg["params"]["textDocument"]["uri"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(version) = core.opened_versions.get_mut(&uri) {
+                        *version += 1;
+                        let new_version = *version;
+                        let text = msg["params"]["textDocument"]["text"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        if core.verbose {
+                            eprintln!(
+                                "[DAEMON] rewriting didOpen → didChange v{new_version} for {uri}"
+                            );
+                        }
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/didChange",
+                            "params": {
+                                "textDocument": {"uri": uri, "version": new_version},
+                                "contentChanges": [{"text": text}]
+                            }
+                        })
+                    } else {
+                        core.opened_versions.insert(uri, 1);
+                        msg
+                    }
+                } else {
+                    msg
+                };
+
+                if let Err(e) = core.send_raw(&forwarded) {
                     if core.verbose {
                         eprintln!("[DAEMON] write to server failed: {e}");
                     }
@@ -362,6 +406,7 @@ pub fn run_daemon(
         server_rx: rx,
         next_id: 1,
         verbose,
+        opened_versions: HashMap::new(),
     };
 
     // ---- LSP initialisation -------------------------------------------------

@@ -1,0 +1,7 @@
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Prevent this fixture from being treated as part of any parent workspace.
+[workspace]
