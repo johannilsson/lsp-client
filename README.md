@@ -80,6 +80,26 @@ lsp-client session stop
 | `--json` | — | Emit `{"ok": true, "result": ...}` JSON |
 | `--verbose` / `-v` | — | Debug logging to stderr |
 
+## Configuration file
+
+Instead of passing `--server`, `--language-id`, and other flags on every `session start`, you can place a `.lsp-client.toml` in your project root:
+
+```toml
+server      = "/path/to/kotlin-language-server"
+language_id = "kotlin"
+root        = "/path/to/your/project"   # defaults to cwd if omitted
+timeout     = "30s"
+no_server_stdio_flag = false
+```
+
+All fields are optional. `lsp-client` walks up from the current directory to find the nearest `.lsp-client.toml`, so placing it at the repo root covers all subdirectories.
+
+With the file in place, starting a session is just:
+
+```sh
+lsp-client session start
+```
+
 ## Server-specific setup
 
 ### kotlin-lsp (Kotlin)
