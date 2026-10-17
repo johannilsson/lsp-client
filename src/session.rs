@@ -139,6 +139,9 @@ impl LspSession {
                 "workspace": {
                     "symbol": {},
                 },
+                // Without this, servers (e.g. rust-analyzer) send no $/progress,
+                // and wait_for_idle cannot tell when indexing has finished.
+                "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
         }))?;
