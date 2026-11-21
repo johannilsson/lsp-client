@@ -200,7 +200,9 @@ impl DaemonCore {
     /// whole of a long background import.
     ///
     /// `strict == true`: return only once every progress token has ended and
-    /// the server has been quiet for 500 ms.  Used by `lsp-client/waitIdle`.
+    /// the server has been quiet for 500 ms, or, if it leaves a token open, quiet
+    /// for 2 s, unless it announced a project import that is still running.
+    /// Used by `lsp-client/waitIdle`.
     ///
     /// Returns `true` if idle was reached, `false` on timeout.
     fn wait_for_idle(&mut self, max_wait: Duration, strict: bool) -> bool {
@@ -218,13 +220,18 @@ impl DaemonCore {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     let quiet = last_activity.elapsed();
-                    let import_done = !self.import.expected || self.import.finished;
+                    let import_running = self.import.expected && !self.import.finished;
                     let idle = self.pending_progress.is_empty()
-                        && import_done
+                        && !import_running
                         && quiet >= Duration::from_millis(500);
-                    let gave_up = !strict && quiet >= Duration::from_secs(2);
-                    if idle || gave_up {
-                        return idle;
+                    // Some servers never end a progress token, so a server that has gone
+                    // quiet for 2 s counts as done even with one still open.  The one
+                    // exception is a project import the server announced and has not
+                    // finished (kotlin-lsp's Gradle sync): that is waited for, however
+                    // quiet it is, until `max_wait`.
+                    let quiet_done = quiet >= Duration::from_secs(2) && !(strict && import_running);
+                    if idle || quiet_done {
+                        return true;
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => return false,
