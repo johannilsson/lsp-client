@@ -112,6 +112,13 @@ impl TimeoutCtrl {
     }
 }
 
+/// How to start a server that is not listening yet: its binary, and the arguments
+/// that make it listen on the TCP port (from its server profile), if they are known.
+pub struct AutoStart<'a> {
+    pub bin: &'a str,
+    pub args: Option<Vec<String>>,
+}
+
 /// Owns the transport I/O and optionally a child process (for stdio mode).
 pub struct Transport {
     pub reader: MessageReader,
@@ -129,16 +136,24 @@ impl Transport {
     pub fn tcp_with_autostart(
         host: &str,
         port: u16,
-        server_bin: Option<&str>,
+        server: Option<AutoStart<'_>>,
         verbose: bool,
     ) -> Result<Self> {
         match TcpStream::connect((host, port)) {
             Ok(stream) => Self::from_tcp(stream),
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                let Some(bin) = server_bin else {
+                let Some(AutoStart { bin, args }) = server else {
                     return Err(format!(
                         "No server listening on {host}:{port}. \
                          Pass --server <binary> to auto-start one."
+                    )
+                    .into());
+                };
+                let Some(args) = args else {
+                    return Err(format!(
+                        "No server listening on {host}:{port}, and lsp-client does not know which \
+                         flags make '{bin}' listen on a port. Start it yourself and run again with \
+                         --tcp, or leave out --tcp to let lsp-client talk to it over stdio."
                     )
                     .into());
                 };
@@ -148,7 +163,7 @@ impl Transport {
                 eprintln!("No server listening on {host}:{port} — starting {bin}...");
 
                 Command::new(bin)
-                    .args(["--socket", &format!("{host}:{port}"), "--multi-client"])
+                    .args(&args)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
