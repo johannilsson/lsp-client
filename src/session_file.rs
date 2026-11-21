@@ -12,6 +12,9 @@ pub struct SessionInfo {
     pub socket: String,
     pub started_at: u64, // Unix timestamp seconds
     pub initialized: bool,
+    /// Name of the server profile in use (see `servers`); empty in session files
+    /// written before profiles existed.
+    pub profile: String,
 }
 
 /// Stable, deterministic hash of a workspace path used as the session filename.
@@ -51,6 +54,7 @@ impl SessionInfo {
             socket: v["socket"].as_str()?.to_owned(),
             started_at: v["started_at"].as_u64().unwrap_or(0),
             initialized: v["initialized"].as_bool().unwrap_or(false),
+            profile: v["profile"].as_str().unwrap_or("").to_owned(),
         })
     }
 
@@ -67,6 +71,7 @@ impl SessionInfo {
             "socket":      self.socket,
             "started_at":  self.started_at,
             "initialized": self.initialized,
+            "profile":     self.profile,
         });
         std::fs::write(path, v.to_string())
     }

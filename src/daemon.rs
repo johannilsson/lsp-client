@@ -18,6 +18,7 @@
 //! time.  This is correct for LSP (which is already sequential in practice)
 //! and avoids needing an async runtime.
 
+use crate::servers::{self, ServerFacts, ServerProfile};
 use crate::session_file::{unix_timestamp, SessionInfo};
 use crate::transport::MessageReader;
 use serde_json::{json, Value};
@@ -60,27 +61,29 @@ struct DaemonCore {
     /// Kept across calls: servers such as kotlin-lsp run a Gradle import that
     /// can stay silent for minutes while its token is still open.
     pending_progress: HashSet<Value>,
-    /// IntelliJ-based servers (kotlin-lsp) announce a project import with
-    /// `intellij/workspaceImportStatus` and report its outcome with
-    /// `intellij/workspaceImportState`.  The import can start several seconds
-    /// after `initialized`, and may report no `$/progress` at all, so once a
-    /// server has announced one, idle also requires the import to be finished.
-    import: ImportState,
-}
-
-#[derive(Default)]
-struct ImportState {
-    /// The server announced a project import.
-    expected: bool,
-    /// The server reported the import as finished (successfully or not).
-    finished: bool,
-    /// One line per folder whose import failed, from the last finished import.
-    failures: Vec<String>,
+    /// Server-specific behaviour (see `servers`). Generic until the server has
+    /// answered `initialize` and told us what it is.
+    profile: Box<dyn ServerProfile>,
+    /// What the profile has learned about the server, e.g. that it is importing a
+    /// project. Stays empty for servers whose profile knows nothing to record.
+    facts: ServerFacts,
+    /// Notifications that arrived before the profile was chosen, to hand to it once
+    /// it is. `None` once that has happened.
+    early: Option<Vec<Value>>,
 }
 
 impl DaemonCore {
     fn send_raw(&mut self, msg: &Value) -> io::Result<()> {
         send_framed(self.server_writer.as_mut(), msg)
+    }
+
+    /// Switch to `profile` (chosen after `initialize`), and let it see the
+    /// notifications the server sent before we knew which profile to use.
+    fn use_profile(&mut self, profile: Box<dyn ServerProfile>) {
+        self.profile = profile;
+        for msg in self.early.take().unwrap_or_default() {
+            self.profile.on_message(&msg, &mut self.facts);
+        }
     }
 
     /// Send a JSON-RPC request to the server and return its response.
@@ -120,41 +123,16 @@ impl DaemonCore {
         let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
             return false;
         };
+        if let Some(early) = &mut self.early
+            && msg.get("id").is_none()
+        {
+            early.push(msg.clone());
+        }
+        self.profile.on_message(msg, &mut self.facts);
         match method {
             // A created token only counts once it begins: kotlin-lsp creates
             // tokens and then cancels the create request without using them.
             "window/workDoneProgress/create" => {}
-            "intellij/workspaceImportStatus" => {
-                if !self.import.finished {
-                    self.import.expected = true;
-                }
-                if self.verbose {
-                    eprintln!("[DAEMON] <<< {method} {}", msg["params"]);
-                }
-            }
-            "intellij/workspaceImportState" => {
-                let params = &msg["params"];
-                self.import.expected = true;
-                self.import.finished = params["phase"].as_str() == Some("FINISHED");
-                if self.import.finished {
-                    self.import.failures = params["folders"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|f| f["status"].as_str() == Some("FAILED"))
-                        .map(|f| {
-                            format!(
-                                "{}: {}",
-                                f["folderUri"].as_str().unwrap_or("?"),
-                                f["message"].as_str().unwrap_or("import failed")
-                            )
-                        })
-                        .collect();
-                }
-                if self.verbose {
-                    eprintln!("[DAEMON] <<< {method} {params}");
-                }
-            }
             "$/progress" => {
                 let token = &msg["params"]["token"];
                 let kind = msg["params"]["value"]["kind"].as_str().unwrap_or("");
@@ -220,7 +198,7 @@ impl DaemonCore {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     let quiet = last_activity.elapsed();
-                    let import_running = self.import.expected && !self.import.finished;
+                    let import_running = self.facts.import.expected && !self.facts.import.finished;
                     let idle = self.pending_progress.is_empty()
                         && !import_running
                         && quiet >= Duration::from_millis(500);
@@ -331,7 +309,7 @@ fn handle_connection(
                 let idle = core.wait_for_idle(max_wait, true);
                 let result = json!({
                     "status": if idle { "idle" } else { "timeout" },
-                    "importFailures": core.import.failures,
+                    "importFailures": core.facts.import.failures,
                 });
                 let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
                 let _ = send_framed(&mut writer, &resp);
@@ -440,6 +418,7 @@ pub fn run_daemon(
     idle_secs: u64,
     verbose: bool,
     language_id: &str,
+    profile: Option<&str>,
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
@@ -479,7 +458,9 @@ pub fn run_daemon(
         verbose,
         opened_versions: HashMap::new(),
         pending_progress: HashSet::new(),
-        import: ImportState::default(),
+        profile: servers::generic(),
+        facts: ServerFacts::default(),
+        early: Some(Vec::new()),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -541,6 +522,13 @@ pub fn run_daemon(
         }),
     )?;
 
+    // Now the server has said what it is, choose its profile (see `servers`).
+    let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
+    core.use_profile(servers::select(profile, server_name)?);
+    if verbose {
+        eprintln!("[DAEMON] server profile: {}", core.profile.name());
+    }
+
     core.notify("initialized", json!({}))?;
     core.wait_for_idle(Duration::from_secs(60), false);
 
@@ -567,6 +555,7 @@ pub fn run_daemon(
         socket: socket_path.clone(),
         started_at: unix_timestamp(),
         initialized: true,
+        profile: core.profile.name().to_owned(),
     };
     info.save()?;
 
@@ -631,4 +620,59 @@ pub fn run_daemon(
 
     eprintln!("[DAEMON] stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn core_for_test() -> DaemonCore {
+        let (_tx, rx) = mpsc::channel();
+        DaemonCore {
+            server_writer: Box::new(io::sink()),
+            server_rx: rx,
+            next_id: 1,
+            verbose: false,
+            opened_versions: HashMap::new(),
+            pending_progress: HashSet::new(),
+            profile: servers::generic(),
+            facts: ServerFacts::default(),
+            early: Some(Vec::new()),
+        }
+    }
+
+    fn failed_import() -> Value {
+        json!({"jsonrpc": "2.0", "method": "intellij/workspaceImportState", "params": {
+            "phase": "FINISHED",
+            "folders": [{"folderUri": "file:///p/", "message": "Gradle sync failed", "status": "FAILED"}],
+        }})
+    }
+
+    #[test]
+    fn what_arrives_before_the_profile_is_known_is_replayed_to_it() {
+        let mut core = core_for_test();
+        // Sent while `initialize` is still being answered: nobody knows the server yet.
+        core.observe(&failed_import());
+        assert!(core.facts.import.failures.is_empty());
+        core.use_profile(servers::by_name("kotlin-lsp").unwrap());
+        assert_eq!(core.facts.import.failures.len(), 1);
+        assert!(core.early.is_none());
+    }
+
+    #[test]
+    fn nothing_reaches_the_facts_of_a_server_without_a_profile() {
+        let mut core = core_for_test();
+        core.observe(&failed_import());
+        core.use_profile(servers::generic());
+        core.observe(&failed_import());
+        assert!(!core.facts.import.expected && core.facts.import.failures.is_empty());
+    }
+
+    #[test]
+    fn requests_from_the_server_are_not_replayed() {
+        // Only notifications are kept; a request has an id and is answered on the spot.
+        let mut core = core_for_test();
+        core.observe(&json!({"jsonrpc": "2.0", "id": 7, "method": "intellij/workspaceImportState", "params": {}}));
+        assert_eq!(core.early.as_ref().map(Vec::len), Some(0));
+    }
 }
