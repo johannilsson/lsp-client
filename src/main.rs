@@ -958,7 +958,7 @@ fn start_daemon(
     cmd.stdout(Stdio::null());
     cmd.stderr(if verbose { Stdio::inherit() } else { Stdio::null() });
 
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
     // Poll for the session file to appear — this means the daemon has
     // successfully initialised the LSP server and is ready to accept clients.
@@ -971,6 +971,16 @@ fn start_daemon(
     loop {
         if SessionInfo::load(root).map(|i| i.initialized).unwrap_or(false) {
             return Ok(());
+        }
+        // A daemon that has exited (typically because the language server failed to
+        // start) will never become ready: say so now rather than after `max_wait`,
+        // which follows `--timeout` and can be minutes.
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "the daemon exited ({status}) before it was ready; the language server probably failed to start (check that '{server}' runs, or use '{} --verbose session start' to see its output)",
+                exe.display()
+            )
+            .into());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
