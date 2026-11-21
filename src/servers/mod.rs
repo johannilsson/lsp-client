@@ -78,6 +78,23 @@ pub trait ServerProfile: Send {
     fn answer_request(&mut self, _method: &str, _params: &Value, _build_tool: Option<&str>) -> Option<Value> {
         None
     }
+
+    /// Tidy the markdown of a hover answer, before the generic clean-up (which turns
+    /// any remaining editor `command:` link into its text).
+    fn rewrite_hover(&self, markdown: String) -> String {
+        markdown
+    }
+
+    /// Whether to show a symbol from `workspace/symbol`.
+    fn keep_workspace_symbol(&self, _symbol: &Value) -> bool {
+        true
+    }
+
+    /// Whether to show a diagnostic. `source` is the text of the file, if it could be
+    /// read; without it a profile that needs the text keeps the diagnostic.
+    fn keep_diagnostic(&self, _diagnostic: &Value, _source: Option<&str>) -> bool {
+        true
+    }
 }
 
 struct Generic;

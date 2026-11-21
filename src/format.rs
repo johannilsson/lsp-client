@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::collections::HashSet;
+use crate::servers::ServerProfile;
 
 fn uri_to_path(uri: &str) -> &str {
     uri.strip_prefix("file://").unwrap_or(uri)
@@ -116,30 +117,8 @@ pub fn format_capabilities(caps: &Value) -> String {
     if lines.is_empty() { "No capabilities reported.".into() } else { lines.join("\n") }
 }
 
-/// Decode `%XX` escapes (as in a URI query string).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-        {
-            out.push(b);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Rewrite markdown links whose target is an editor `command:` URI, which no
-/// CLI caller can follow.  kotlin-lsp's `command:jetbrains.navigateToLocation?
-/// ["<uri>",line,col]` becomes `text (path:line:col)` (1-based); any other
-/// command link is reduced to its text.
+/// Turn markdown links whose target is an editor `command:` URI into their text:
+/// they run a command in an editor, and no command line caller can follow them.
 fn strip_command_links(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
     let mut rest = md;
@@ -149,25 +128,16 @@ fn strip_command_links(md: &str) -> String {
         };
         out.push_str(&rest[..open]);
         out.push_str(&rest[open + 1..i]);
-        let target = &rest[i + 2..close];
-        if let Some(args) = target.strip_prefix("command:jetbrains.navigateToLocation?")
-            && let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&percent_decode(args))
-            && let (Some(uri), Some(line), Some(col)) = (
-                a.first().and_then(|v| v.as_str()),
-                a.get(1).and_then(|v| v.as_u64()),
-                a.get(2).and_then(|v| v.as_u64()),
-            )
-        {
-            out.push_str(&format!(" ({}:{}:{})", uri_to_path(uri), line + 1, col + 1));
-        }
         rest = &rest[close + 1..];
     }
     out.push_str(rest);
     out
 }
 
-pub fn format_hover(resp: &Value) -> String {
-    strip_command_links(&format_hover_raw(resp))
+/// Hover text. The profile may tidy it first; whatever editor `command:` links are
+/// left become plain text.
+pub fn format_hover(resp: &Value, profile: &dyn ServerProfile) -> String {
+    strip_command_links(&profile.rewrite_hover(format_hover_raw(resp)))
 }
 
 fn format_hover_raw(resp: &Value) -> String {
@@ -262,7 +232,8 @@ fn walk_symbols(symbols: &[Value], indent: usize, lines: &mut Vec<String>) {
     }
 }
 
-pub fn format_workspace_symbols(resp: &Value) -> String {
+/// Workspace symbols, each declaration once, and only those the profile wants shown.
+pub fn format_workspace_symbols(resp: &Value, profile: &dyn ServerProfile) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No symbols found.".into();
     };
@@ -272,16 +243,11 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
     if arr.is_empty() {
         return "No symbols found.".into();
     }
-    // kotlin-lsp can list the same declaration once per source set that
-    // contains it, and again from the project's own compiled classes jar under
-    // build/intermediates/ (Android). Show each source declaration once.
+    // A server can list the same declaration more than once, e.g. once per source set
+    // that contains it. Show each (name, kind, location) once.
     let mut seen = std::collections::HashSet::new();
-    let is_own_build_output = |s: &&Value| {
-        let uri = s["location"]["uri"].as_str().unwrap_or("");
-        uri.starts_with("jar:") && uri.contains("/build/intermediates/")
-    };
     arr.iter()
-        .filter(|s| !is_own_build_output(s))
+        .filter(|s| profile.keep_workspace_symbol(s))
         .filter(|s| seen.insert((s["name"].to_string(), s["kind"].to_string(), s["location"].to_string())))
         .map(|s| {
             let kind = symbol_kind(s["kind"].as_u64().unwrap_or(0));
@@ -295,54 +261,13 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
         .join("\n")
 }
 
-/// True if `text` contains a `@Composable` annotation (plain or qualified,
-/// e.g. `@androidx.compose.runtime.Composable`), but not `@ComposableTarget`
-/// and the like.
-fn mentions_composable(text: &str) -> bool {
-    const NAME: &str = "Composable";
-    text.match_indices(NAME).any(|(i, _)| {
-        let before = &text[..i];
-        let after = text[i + NAME.len()..].chars().next();
-        let boundary = after.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        let annotated = before.contains('@') && (before.ends_with('@') || before.ends_with('.'));
-        boundary && annotated
-    })
-}
-
-/// Whether the declaration starting at 0-based `line`/`col` of `source` is
-/// annotated `@Composable`: on the same line before `col`, or in the
-/// annotation lines directly above it.  Annotations can span lines
-/// (`@OptIn(\n Foo::class\n)`), so the walk upwards continues until a blank
-/// line, the end of a previous declaration or block (`{`, `}`, `;`) or the end
-/// of a comment, for at most 12 lines.
-fn is_composable_declaration(source: &str, line: usize, col: usize) -> bool {
-    let lines: Vec<&str> = source.lines().collect();
-    let Some(&decl) = lines.get(line) else {
-        return false;
-    };
-    let prefix_end = decl.char_indices().nth(col).map_or(decl.len(), |(i, _)| i);
-    if mentions_composable(&decl[..prefix_end]) {
-        return true;
-    }
-    for above in lines[..line].iter().rev().take(12) {
-        let t = above.trim();
-        if t.is_empty() || t.ends_with(['{', '}', ';']) || t.ends_with("*/") || t.starts_with("//") {
-            return false;
-        }
-        if mentions_composable(t) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Diagnostics as text.
 ///
-/// `source` is the file's text.  With it, and unless `show_all` is set,
-/// `FunctionName` warnings on `@Composable` functions are left out: Compose
-/// names such functions in UpperCase on purpose, and Android Studio does not
-/// report them, but kotlin-lsp does.  Every other diagnostic is kept.
-pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool) -> String {
+/// `source` is the text of the file, for profiles that need it to decide what to
+/// show. The profile may leave diagnostics out (kotlin-lsp: `FunctionName` warnings
+/// on `@Composable` functions, which Compose names in UpperCase on purpose);
+/// `show_all` shows everything the server reported.
+pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool, profile: &dyn ServerProfile) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No diagnostics.".into();
     };
@@ -353,20 +278,7 @@ pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool) ->
     } else {
         return "No diagnostics.".into();
     };
-    let is_composable_name = |d: &&Value| {
-        if show_all || d["code"].as_str() != Some("FunctionName") {
-            return false;
-        }
-        let (Some(src), Some(line), Some(col)) = (
-            source,
-            d["range"]["start"]["line"].as_u64(),
-            d["range"]["start"]["character"].as_u64(),
-        ) else {
-            return false;
-        };
-        is_composable_declaration(src, line as usize, col as usize)
-    };
-    let items: Vec<&Value> = items.iter().filter(|d| !is_composable_name(d)).collect();
+    let items: Vec<&Value> = items.iter().filter(|d| show_all || profile.keep_diagnostic(d, source)).collect();
     if items.is_empty() {
         return "No diagnostics.".into();
     }
@@ -593,13 +505,20 @@ fn completion_kind(kind: u64) -> &'static str {
     }
 }
 
-pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value, source: Option<&str>) -> String {
+pub fn format_context(
+    hover: &Value,
+    definition: &Value,
+    references: &Value,
+    diagnostics: &Value,
+    source: Option<&str>,
+    profile: &dyn ServerProfile,
+) -> String {
     let mut out = String::new();
 
     // Hover
     let hover_text = match hover.get("result").filter(|v| !v.is_null()) {
         Some(_) => {
-            let s = format_hover(hover);
+            let s = format_hover(hover, profile);
             if s == "No hover information found." { None } else { Some(s) }
         }
         None => None,
@@ -645,7 +564,7 @@ pub fn format_context(hover: &Value, definition: &Value, references: &Value, dia
     // Diagnostics
     let diag_text = match diagnostics.get("result").filter(|v| !v.is_null()) {
         Some(_) => {
-            let s = format_diagnostics(diagnostics, source, false);
+            let s = format_diagnostics(diagnostics, source, false, profile);
             if s == "No diagnostics." { None } else { Some(s) }
         }
         None => None,
@@ -699,89 +618,76 @@ pub fn format_completion(resp: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::servers;
     use serde_json::json;
 
     #[test]
-    fn navigate_link_becomes_path() {
-        let md = "From class: [`a.B`](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%2FB.java%22%2C5%2C19%5D)\nmore";
-        assert_eq!(strip_command_links(md), "From class: `a.B` (/x/B.java:6:20)\nmore");
-    }
-
-    #[test]
-    fn other_command_link_keeps_text_and_normal_links_stay() {
+    fn command_links_become_their_text_and_normal_links_stay() {
         let md = "[run](command:foo?x) and [docs](https://example.com)";
         assert_eq!(strip_command_links(md), "run and [docs](https://example.com)");
+        // Not a link at all, or an unfinished one: left as it is.
+        assert_eq!(strip_command_links("a ](command:x"), "a ](command:x");
     }
 
-    fn function_name_warning(line: u64, col: u64) -> Value {
+    fn hover(md: &str) -> Value {
+        json!({"result": {"contents": {"kind": "markdown", "value": md}}})
+    }
+
+    #[test]
+    fn hover_links_follow_the_profile_then_the_generic_clean_up() {
+        let md = "From [`a.B`](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%2FB.java%22%2C5%2C19%5D), [run](command:foo)";
+        // kotlin-lsp: its place links become a place; the other link becomes its text.
+        let kotlin = servers::by_name("kotlin-lsp").unwrap();
+        assert_eq!(format_hover(&hover(md), &*kotlin), "From `a.B` (/x/B.java:6:20), run");
+        // Another server: every command link is just its text.
+        assert_eq!(format_hover(&hover(md), &*servers::generic()), "From `a.B`, run");
+    }
+
+    fn symbol(uri: &str) -> Value {
+        json!({"name": "f", "kind": 12, "containerName": "p",
+            "location": {"uri": uri, "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 5}}}})
+    }
+
+    #[test]
+    fn workspace_symbols_are_shown_once_and_the_profile_can_drop_some() {
+        let own_jar = "jar:///p/app/build/intermediates/x/classes.jar!/AKt.class";
+        let resp = json!({"result": [symbol("file:///a.kt"), symbol("file:///a.kt"), symbol(own_jar)]});
+        // Identical entries collapse; a profile that doesn't know the jar keeps it.
+        assert_eq!(format_workspace_symbols(&resp, &*servers::generic()).lines().count(), 2);
+        // kotlin-lsp's profile drops the project's own compiled jar.
+        let out = format_workspace_symbols(&resp, &*servers::by_name("kotlin-lsp").unwrap());
+        assert_eq!(out.lines().count(), 1, "{out}");
+    }
+
+    fn function_name_warning() -> Value {
         json!({"code": "FunctionName", "severity": 2,
                "message": "Function name 'Foo' should start with a lowercase letter",
-               "range": {"start": {"line": line, "character": col}, "end": {"line": line, "character": col + 3}}})
+               "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}})
     }
 
-    fn diag_text(items: Vec<Value>, source: &str, all: bool) -> String {
-        format_diagnostics(&json!({"result": {"items": items}}), Some(source), all)
+    fn diagnostics(items: Vec<Value>) -> Value {
+        json!({"result": {"items": items}})
     }
 
     #[test]
-    fn composable_function_names_are_not_reported() {
+    fn diagnostics_go_through_the_profile_and_all_shows_everything() {
         let src = "@Composable\nfun Foo() {}\n";
-        assert_eq!(diag_text(vec![function_name_warning(1, 4)], src, false), "No diagnostics.");
-        // …unless asked for.
-        assert!(diag_text(vec![function_name_warning(1, 4)], src, true).contains("Foo"));
+        let resp = diagnostics(vec![function_name_warning()]);
+        let kotlin = servers::by_name("kotlin-lsp").unwrap();
+        assert_eq!(format_diagnostics(&resp, Some(src), false, &*kotlin), "No diagnostics.");
+        assert!(format_diagnostics(&resp, Some(src), true, &*kotlin).contains("Foo"));
+        // Another server's diagnostics are shown whatever the source says.
+        assert!(format_diagnostics(&resp, Some(src), false, &*servers::generic()).contains("Foo"));
     }
 
     #[test]
-    fn composable_detection_covers_common_layouts() {
-        for src in [
-            "@Composable fun Foo() {}",
-            "@Composable\n@OptIn(ExperimentalFoo::class)\nfun Foo() {}",
-            "@OptIn(\n    ExperimentalFoo::class,\n)\n@Composable\nfun Foo() {}",
-            "@androidx.compose.runtime.Composable\nprivate fun Foo() {}",
-            "@Composable()\ninternal fun Foo() {}",
-        ] {
-            let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
-            let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
-            assert_eq!(diag_text(vec![function_name_warning(line as u64, col)], src, false), "No diagnostics.", "{src}");
-        }
-    }
-
-    #[test]
-    fn other_function_name_warnings_are_kept() {
-        for src in [
-            "fun Foo() {}",
-            // The annotation belongs to the previous function.
-            "@Composable\nfun a() {\n}\nfun Foo() {}",
-            // Similar names are not @Composable.
-            "@ComposableTarget(\"x\")\nfun Foo() {}",
-            "// @Composable\nfun Foo() {}",
-        ] {
-            let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
-            let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
-            assert!(diag_text(vec![function_name_warning(line as u64, col)], src, false).contains("Foo"), "{src}");
-        }
-    }
-
-    #[test]
-    fn composable_filter_leaves_other_diagnostics_alone() {
+    fn a_kept_diagnostic_next_to_a_hidden_one_is_still_listed() {
         let src = "@Composable\nfun Foo() {}\n";
         let other = json!({"code": "SomethingElse", "severity": 2, "message": "unused",
                            "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}});
-        let out = diag_text(vec![function_name_warning(1, 4), other], src, false);
+        let resp = diagnostics(vec![function_name_warning(), other]);
+        let out = format_diagnostics(&resp, Some(src), false, &*servers::by_name("kotlin-lsp").unwrap());
         assert_eq!(out.lines().count(), 1, "{out}");
         assert!(out.contains("unused"));
-        // Without the source we cannot tell, so nothing is hidden.
-        let no_src = format_diagnostics(&json!({"result": {"items": [function_name_warning(1, 4)]}}), None, false);
-        assert!(no_src.contains("Foo"));
-    }
-
-    #[test]
-    fn workspace_symbols_are_deduplicated() {
-        let sym = json!({"name": "f", "kind": 12, "containerName": "p",
-            "location": {"uri": "file:///a.kt", "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 5}}}});
-        let mut own_jar = sym.clone();
-        own_jar["location"]["uri"] = json!("jar:///p/app/build/intermediates/x/classes.jar!/AKt.class");
-        let out = format_workspace_symbols(&json!({"result": [sym.clone(), sym, own_jar]}));
-        assert_eq!(out.lines().count(), 1, "{out}");
     }
 }

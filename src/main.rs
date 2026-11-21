@@ -143,8 +143,8 @@ enum QueryCommand {
     /// Get errors and warnings for a file
     Diagnostics {
         file: String,
-        /// Also show `FunctionName` warnings on @Composable functions, which are
-        /// hidden by default (Compose names such functions in UpperCase on purpose)
+        /// Also show the diagnostics the server profile leaves out (see `servers`;
+        /// for kotlin-lsp: `FunctionName` warnings on @Composable functions)
         #[arg(long)]
         all: bool,
     },
@@ -626,6 +626,9 @@ fn main() {
             session.initialize(root)?
         };
 
+        // What to tidy in the answers depends on the server: see `servers`.
+        let profile = output_profile(effective.server_profile.as_deref(), use_daemon, root, &init_resp);
+
         // WaitReady: send lsp-client/waitIdle and exit.
         if let Command::Session { command: SessionCommand::WaitReady { wait_timeout } } =
             &cli.command
@@ -708,7 +711,7 @@ fn main() {
                 QueryCommand::Hover { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.hover(&abs, line - 1, col - 1)?;
-                    if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp)) }
+                    if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp, &*profile)) }
                 }
                 QueryCommand::Definition { file, line, col } => {
                     let abs = abs_path(file);
@@ -762,7 +765,7 @@ fn main() {
                     if cli.json {
                         print_json(&resp)
                     } else {
-                        println!("{}", format_workspace_symbols(&resp))
+                        println!("{}", format_workspace_symbols(&resp, &*profile))
                     }
                 }
                 QueryCommand::Diagnostics { file, all } => {
@@ -772,7 +775,7 @@ fn main() {
                         print_json(&resp)
                     } else {
                         let source = std::fs::read_to_string(&abs).ok();
-                        println!("{}", format_diagnostics(&resp, source.as_deref(), *all))
+                        println!("{}", format_diagnostics(&resp, source.as_deref(), *all, &*profile))
                     }
                 }
                 QueryCommand::Completion { file, line, col } => {
@@ -851,7 +854,7 @@ fn main() {
                         }));
                     } else {
                         let source = std::fs::read_to_string(&abs).ok();
-                        print!("{}", format_context(&hover, &def, &refs, &diag, source.as_deref()));
+                        print!("{}", format_context(&hover, &def, &refs, &diag, source.as_deref(), &*profile));
                     }
                 }
             },
@@ -1032,6 +1035,25 @@ fn start_daemon(
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// The server profile for tidying answers. With a daemon it is the one the daemon runs
+/// with (stored in the session file); without one, it is chosen from the server's own
+/// `initialize` answer, as the daemon does.
+fn output_profile(
+    requested: Option<&str>,
+    use_daemon: bool,
+    root: &str,
+    init_resp: &serde_json::Value,
+) -> Box<dyn servers::ServerProfile> {
+    if use_daemon
+        && let Some(info) = SessionInfo::load(root)
+        && let Some(profile) = servers::by_name(&info.profile)
+    {
+        return profile;
+    }
+    let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
+    servers::select(requested, server_name).unwrap_or_else(|_| servers::generic())
 }
 
 /// The last `n` lines of the file at `path`, reading only its end.

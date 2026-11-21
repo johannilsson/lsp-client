@@ -88,6 +88,72 @@ impl ServerProfile for KotlinLsp {
         }
     }
 
+    /// The server links to declarations with `command:jetbrains.navigateToLocation?
+    /// ["<uri>",line,col]` (percent-encoded), which a command line cannot follow:
+    /// show the place as `text (path:line:col)` instead.
+    fn rewrite_hover(&self, markdown: String) -> String {
+        const LINK: &str = "](command:jetbrains.navigateToLocation?";
+        let mut out = String::with_capacity(markdown.len());
+        let mut rest = markdown.as_str();
+        while let Some(i) = rest.find(LINK) {
+            let (Some(open), Some(close)) = (rest[..i].rfind('['), rest[i..].find(')').map(|j| i + j)) else {
+                break;
+            };
+            let args = &rest[i + LINK.len()..close];
+            let place = match serde_json::from_str::<Value>(&percent_decode(args)) {
+                Ok(Value::Array(a)) => match (
+                    a.first().and_then(|v| v.as_str()),
+                    a.get(1).and_then(|v| v.as_u64()),
+                    a.get(2).and_then(|v| v.as_u64()),
+                ) {
+                    (Some(uri), Some(line), Some(col)) => {
+                        Some(format!(" ({}:{}:{})", uri.strip_prefix("file://").unwrap_or(uri), line + 1, col + 1))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(place) = place else {
+                // Not the shape we know: leave it for the generic clean-up.
+                out.push_str(&rest[..close + 1]);
+                rest = &rest[close + 1..];
+                continue;
+            };
+            out.push_str(&rest[..open]);
+            out.push_str(&rest[open + 1..i]);
+            out.push_str(&place);
+            rest = &rest[close + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// On Android the server also lists every declaration from the project's own
+    /// compiled classes jar, under `build/intermediates/`. Those are the same
+    /// declarations as in the source, so only the source ones are shown.
+    fn keep_workspace_symbol(&self, symbol: &Value) -> bool {
+        let uri = symbol["location"]["uri"].as_str().unwrap_or("");
+        !(uri.starts_with("jar:") && uri.contains("/build/intermediates/"))
+    }
+
+    /// Compose names UI functions in UpperCase on purpose, and Android Studio does
+    /// not report it, but the server warns `Function name 'Foo' should start with a
+    /// lowercase letter` (inspection `FunctionName`) for every one. Leave out those
+    /// on `@Composable` functions; every other diagnostic is kept.
+    fn keep_diagnostic(&self, diagnostic: &Value, source: Option<&str>) -> bool {
+        if diagnostic["code"].as_str() != Some("FunctionName") {
+            return true;
+        }
+        let (Some(source), Some(line), Some(col)) = (
+            source,
+            diagnostic["range"]["start"]["line"].as_u64(),
+            diagnostic["range"]["start"]["character"].as_u64(),
+        ) else {
+            return true;
+        };
+        !is_composable_declaration(source, line as usize, col as usize)
+    }
+
     /// With more than one build tool in a folder the server asks "Use Gradle / Use
     /// Maven / Configure…". `--build-tool gradle` answers by pressing the button whose
     /// title contains that word; without it the question is dismissed. The server
@@ -103,6 +169,67 @@ impl ServerProfile for KotlinLsp {
             .find(|a| a["title"].as_str().is_some_and(|t| t.to_lowercase().contains(&want)))
             .cloned()
     }
+}
+
+/// Decode `%XX` escapes (as in a URI query string).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// True if `text` contains a `@Composable` annotation (plain or qualified,
+/// e.g. `@androidx.compose.runtime.Composable`), but not `@ComposableTarget`
+/// and the like.
+fn mentions_composable(text: &str) -> bool {
+    const NAME: &str = "Composable";
+    text.match_indices(NAME).any(|(i, _)| {
+        let before = &text[..i];
+        let after = text[i + NAME.len()..].chars().next();
+        let boundary = after.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let annotated = before.contains('@') && (before.ends_with('@') || before.ends_with('.'));
+        boundary && annotated
+    })
+}
+
+/// Whether the declaration starting at 0-based `line`/`col` of `source` is
+/// annotated `@Composable`: on the same line before `col`, or in the
+/// annotation lines directly above it.  Annotations can span lines
+/// (`@OptIn(\n Foo::class\n)`), so the walk upwards continues until a blank
+/// line, the end of a previous declaration or block (`{`, `}`, `;`) or the end
+/// of a comment, for at most 12 lines.
+fn is_composable_declaration(source: &str, line: usize, col: usize) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let Some(&decl) = lines.get(line) else {
+        return false;
+    };
+    let prefix_end = decl.char_indices().nth(col).map_or(decl.len(), |(i, _)| i);
+    if mentions_composable(&decl[..prefix_end]) {
+        return true;
+    }
+    for above in lines[..line].iter().rev().take(12) {
+        let t = above.trim();
+        if t.is_empty() || t.ends_with(['{', '}', ';']) || t.ends_with("*/") || t.starts_with("//") {
+            return false;
+        }
+        if mentions_composable(t) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Human-readable explanation of why a folder was not imported.  `status` and
@@ -296,6 +423,94 @@ mod tests {
         let mut generic = servers::generic();
         generic.on_message(&log_message("Log file: /tmp/elsewhere.log"), &mut facts);
         assert_eq!(facts.server_log, None);
+    }
+
+    #[test]
+    fn navigate_links_in_hover_text_become_a_place() {
+        let md = "From class: [`a.B`](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%2FB.java%22%2C5%2C19%5D)\nmore";
+        assert_eq!(KotlinLsp::default().rewrite_hover(md.to_string()), "From class: `a.B` (/x/B.java:6:20)\nmore");
+    }
+
+    #[test]
+    fn other_links_in_hover_text_are_left_alone() {
+        let kt = KotlinLsp::default();
+        for md in [
+            "[run](command:foo?x) and [docs](https://example.com)",
+            // The command is this server's, but the arguments are not what we know.
+            "[x](command:jetbrains.navigateToLocation?%5B1%5D)",
+        ] {
+            assert_eq!(kt.rewrite_hover(md.to_string()), md);
+        }
+    }
+
+    #[test]
+    fn symbols_from_the_projects_own_class_jar_are_dropped() {
+        let kt = KotlinLsp::default();
+        let sym = |uri: &str| json!({"name": "f", "kind": 12, "location": {"uri": uri}});
+        assert!(kt.keep_workspace_symbol(&sym("file:///p/app/src/A.kt")));
+        assert!(kt.keep_workspace_symbol(&sym("jar:///root/.gradle/caches/lib/classes.jar!/B.class")));
+        assert!(!kt.keep_workspace_symbol(&sym("jar:///p/app/build/intermediates/x/classes.jar!/AKt.class")));
+    }
+
+    fn function_name_warning(line: u64, col: u64) -> Value {
+        json!({"code": "FunctionName", "severity": 2,
+               "message": "Function name 'Foo' should start with a lowercase letter",
+               "range": {"start": {"line": line, "character": col}, "end": {"line": line, "character": col + 3}}})
+    }
+
+    /// Whether the warning on the `Foo` in `src` is kept.
+    fn warning_kept(src: &str) -> bool {
+        let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
+        let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
+        KotlinLsp::default().keep_diagnostic(&function_name_warning(line as u64, col), Some(src))
+    }
+
+    #[test]
+    fn composable_function_names_are_not_reported() {
+        for src in [
+            "@Composable fun Foo() {}",
+            "@Composable\nfun Foo() {}",
+            "@Composable\n@OptIn(ExperimentalFoo::class)\nfun Foo() {}",
+            "@OptIn(\n    ExperimentalFoo::class,\n)\n@Composable\nfun Foo() {}",
+            "@androidx.compose.runtime.Composable\nprivate fun Foo() {}",
+            "@Composable()\ninternal fun Foo() {}",
+        ] {
+            assert!(!warning_kept(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn other_function_name_warnings_are_kept() {
+        for src in [
+            "fun Foo() {}",
+            // The annotation belongs to the previous function.
+            "@Composable\nfun a() {\n}\nfun Foo() {}",
+            // Similar names are not @Composable.
+            "@ComposableTarget(\"x\")\nfun Foo() {}",
+            "// @Composable\nfun Foo() {}",
+        ] {
+            assert!(warning_kept(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn other_diagnostics_are_kept_and_so_is_everything_without_the_source() {
+        let kt = KotlinLsp::default();
+        let other = json!({"code": "SomethingElse", "severity": 2, "message": "unused",
+                           "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}});
+        assert!(kt.keep_diagnostic(&other, Some("@Composable\nfun Foo() {}\n")));
+        // Without the source we cannot tell, so nothing is hidden.
+        assert!(kt.keep_diagnostic(&function_name_warning(1, 4), None));
+    }
+
+    #[test]
+    fn another_server_keeps_everything() {
+        let generic = servers::generic();
+        let src = "@Composable\nfun Foo() {}\n";
+        assert!(generic.keep_diagnostic(&function_name_warning(1, 4), Some(src)));
+        assert!(generic.keep_workspace_symbol(&json!({"location": {"uri": "jar:///p/build/intermediates/x.jar!/A.class"}})));
+        let md = "[a.B](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%22%2C1%2C2%5D)";
+        assert_eq!(generic.rewrite_hover(md.to_string()), md);
     }
 
     #[test]
