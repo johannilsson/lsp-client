@@ -130,7 +130,13 @@ enum QueryCommand {
         retries: u32,
     },
     /// Get errors and warnings for a file
-    Diagnostics { file: String },
+    Diagnostics {
+        file: String,
+        /// Also show `FunctionName` warnings on @Composable functions, which are
+        /// hidden by default (Compose names such functions in UpperCase on purpose)
+        #[arg(long)]
+        all: bool,
+    },
     /// Get completions at a position
     Completion {
         file: String,
@@ -541,7 +547,7 @@ fn main() {
                     | QueryCommand::Definition { file, .. }
                     | QueryCommand::References { file, .. }
                     | QueryCommand::Symbols { file }
-                    | QueryCommand::Diagnostics { file }
+                    | QueryCommand::Diagnostics { file, .. }
                     | QueryCommand::Completion { file, .. }
                     | QueryCommand::SignatureHelp { file, .. }
                     | QueryCommand::CodeAction { file, .. }
@@ -640,10 +646,15 @@ fn main() {
                         println!("{}", format_workspace_symbols(&resp))
                     }
                 }
-                QueryCommand::Diagnostics { file } => {
+                QueryCommand::Diagnostics { file, all } => {
                     let abs = abs_path(file);
                     let resp = session.diagnostics(&abs)?;
-                    if cli.json { print_json(&resp) } else { println!("{}", format_diagnostics(&resp)) }
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        let source = std::fs::read_to_string(&abs).ok();
+                        println!("{}", format_diagnostics(&resp, source.as_deref(), *all))
+                    }
                 }
                 QueryCommand::Completion { file, line, col } => {
                     let abs = abs_path(file);
@@ -720,7 +731,8 @@ fn main() {
                             "diagnostics": diag,
                         }));
                     } else {
-                        print!("{}", format_context(&hover, &def, &refs, &diag));
+                        let source = std::fs::read_to_string(&abs).ok();
+                        print!("{}", format_context(&hover, &def, &refs, &diag, source.as_deref()));
                     }
                 }
             },
