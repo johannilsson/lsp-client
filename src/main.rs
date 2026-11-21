@@ -514,9 +514,10 @@ fn main() {
             &cli.command
         {
             if use_daemon {
-                // Set a generous read timeout so we can wait a long time.
-                session.transport.set_read_timeout(Some(*wait_timeout));
-                session.wait_idle_request()?;
+                if !session.wait_idle_request(*wait_timeout)? {
+                    eprintln!("Timed out waiting for server to become idle.");
+                    std::process::exit(2);
+                }
             } else {
                 session.wait_for_index(*wait_timeout);
                 if matches!(session.last_idle_result, Some(IdleResult::TimedOut)) {
@@ -571,8 +572,9 @@ fn main() {
             if cli.wait_for_index && use_daemon {
                 let wait_dur =
                     effective.timeout.unwrap_or(std::time::Duration::from_secs(300));
-                session.transport.set_read_timeout(Some(wait_dur));
-                session.wait_idle_request()?;
+                if !session.wait_idle_request(wait_dur)? && cli.verbose {
+                    eprintln!("[DEBUG] server still busy after {wait_dur:?}; querying anyway");
+                }
                 // Restore the configured timeout for subsequent queries.
                 session.transport.set_read_timeout(effective.timeout);
             }
@@ -871,17 +873,18 @@ fn wait_for_daemon_ready(
     verbose: bool,
     timeout: Option<std::time::Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let max_wait = timeout.unwrap_or(std::time::Duration::from_secs(300));
     let transport = Transport::unix_socket(socket)?;
-    if let Some(dur) = timeout.or(Some(std::time::Duration::from_secs(300))) {
-        transport.set_read_timeout(Some(dur));
-    }
+    transport.set_read_timeout(Some(max_wait));
     let mut session = LspSession::new(transport, verbose, timeout);
     // No initialize needed — daemon has the cached result.
     if let Some(f) = wait_file {
         let abs = abs_path(f);
         session.did_open(&abs, language_id)?;
     }
-    session.wait_idle_request()?;
+    if !session.wait_idle_request(max_wait)? {
+        return Err(format!("server still busy after {max_wait:?} (indexing not finished)").into());
+    }
     Ok(())
 }
 

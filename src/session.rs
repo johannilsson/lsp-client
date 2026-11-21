@@ -231,8 +231,17 @@ impl LspSession {
     /// Send a `lsp-client/waitIdle` request to the daemon and block until it
     /// responds (i.e., until the underlying LSP server is idle).  Only
     /// meaningful in daemon mode; in direct TCP mode prefer `wait_for_index`.
-    pub fn wait_idle_request(&mut self) -> Result<Value> {
-        self.request("lsp-client/waitIdle", json!({}))
+    /// Returns `Ok(true)` if the daemon reached idle, `Ok(false)` if it gave
+    /// up after `max_wait` with work still in progress.
+    pub fn wait_idle_request(&mut self, max_wait: Duration) -> Result<bool> {
+        // Leave the socket read timeout a little longer than the daemon's own
+        // deadline so we receive its "timeout" answer rather than an I/O error.
+        self.transport.set_read_timeout(Some(max_wait + Duration::from_secs(10)));
+        let resp = self.request(
+            "lsp-client/waitIdle",
+            json!({"timeoutMs": max_wait.as_millis() as u64}),
+        )?;
+        Ok(resp["result"].as_str() != Some("timeout"))
     }
 
     /// Read and discard incoming messages until the server goes quiet and all
