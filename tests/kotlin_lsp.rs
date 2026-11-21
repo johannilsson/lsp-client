@@ -83,6 +83,17 @@ fn folder_without_a_build_file_is_reported() {
     // The daemon keeps running, so `wait-ready` gives the same answer.
     let again = p.run(&["session", "wait-ready"]);
     assert_eq!(again.status.code(), Some(3), "stderr: {}", stderr(&again));
+
+    // A query still answers (file-level), but says the project was not imported:
+    // an empty answer would otherwise look like "nothing found".
+    let main = p.path().join("src/Main.kt");
+    let hover = p.run(&["query", "hover", main.to_str().unwrap(), "1", "6"]);
+    assert_eq!(hover.status.code(), Some(0), "stderr: {}", stderr(&hover));
+    assert!(stderr(&hover).contains("project not imported"), "stderr: {}", stderr(&hover));
+    // So does `session status`.
+    let status = p.run(&["session", "status"]);
+    let out = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(out.contains("import:      problem") && out.contains("no supported build system"), "{out}");
 }
 
 #[test]
@@ -110,6 +121,10 @@ fn build_tool_option_resolves_the_ambiguity() {
     let main = p.path().join("src/Main.kt");
     let symbols = p.run(&["query", "symbols", main.to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&symbols.stdout).contains("main"), "stderr: {}", stderr(&symbols));
+    // A project that was imported gets no warning, and says so in the status.
+    assert!(!stderr(&symbols).contains("Warning"), "stderr: {}", stderr(&symbols));
+    let status = p.run(&["session", "status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("import:      ok"));
 }
 
 #[test]

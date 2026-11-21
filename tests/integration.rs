@@ -160,3 +160,16 @@ fn test_json_flag() {
     assert_eq!(json["ok"], serde_json::json!(true), "expected ok=true: {s}");
     assert!(json["result"].is_array(), "expected result array: {s}");
 }
+
+#[test]
+fn test_no_import_warnings_for_servers_without_project_imports() {
+    // rust-analyzer never announces a project import, so queries must stay
+    // quiet and the status must say the server does not report imports.
+    let out = run(&["query", "hover", &fixture_file("lib.rs"), "1", "8"]);
+    assert_ok(&out);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("Warning"), "unexpected warning: {err}");
+    let status = run(&["session", "status"]);
+    let s = stdout(&status);
+    assert!(s.contains("import:      n/a"), "expected import n/a: {s}");
+}
