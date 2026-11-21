@@ -31,11 +31,28 @@ impl Workspace {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_env(args, &[])
+    }
+
+    fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         Command::new(BINARY)
             .args(["--root", self.0.to_str().unwrap()])
             .args(args)
+            .envs(env.iter().copied())
             .output()
             .expect("failed to run lsp-client")
+    }
+
+    /// `session start --wait` with the fake server, and `extra` environment / flags.
+    fn start_fake(&self, extra_args: &[&str], env: &[(&str, &str)]) -> Output {
+        let server = fake_server();
+        let mut args = vec![
+            "--timeout", "60s", "--server", server.to_str().unwrap(), "--no-server-stdio-flag",
+            "--language-id", "plain",
+        ];
+        args.extend_from_slice(extra_args);
+        args.extend_from_slice(&["session", "start", "--wait"]);
+        self.run_env(&args, env)
     }
 }
 
@@ -70,6 +87,7 @@ fn server_that_never_ends_a_progress_token_is_still_ready() {
     assert!(!String::from_utf8_lossy(&hover.stderr).contains("Warning"), "stderr: {}", String::from_utf8_lossy(&hover.stderr));
     let status = ws.run(&["session", "status"]);
     assert!(String::from_utf8_lossy(&status.stdout).contains("import:      n/a"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("profile:     generic"));
 }
 
 #[test]
@@ -84,3 +102,80 @@ fn server_that_exits_at_startup_fails_quickly_even_with_a_long_timeout() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("exited"), "stderr: {err}");
 }
+
+const KOTLIN_NAME: &str = "IntelliJ Language Server by JetBrains";
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+fn status_stdout(ws: &Workspace) -> String {
+    String::from_utf8_lossy(&ws.run(&["session", "status"]).stdout).into_owned()
+}
+
+#[test]
+fn another_server_sending_kotlin_lsps_messages_is_not_treated_as_kotlin_lsp() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    // It reports a failed import in kotlin-lsp's own words, but it is not kotlin-lsp.
+    let ws = Workspace::new("not-kotlin");
+    let out = ws.start_fake(
+        &[],
+        &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", "some-other-server"), ("FAKE_LSP_LOG_FILE", "/tmp/fake.log")],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(!stderr(&out).contains("import failed"), "stderr: {}", stderr(&out));
+    let status = status_stdout(&ws);
+    assert!(status.contains("profile:     generic"));
+    // Its "Log file:" message is not taken at its word either.
+    assert!(!status.contains("server log:"), "{status}");
+}
+
+#[test]
+fn a_server_that_calls_itself_kotlin_lsp_gets_the_kotlin_lsp_profile() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("is-kotlin");
+    let out = ws.start_fake(
+        &[],
+        &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", KOTLIN_NAME), ("FAKE_LSP_LOG_FILE", "/tmp/fake.log")],
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    // The log file was announced before `initialize` was answered, so this also
+    // checks that what arrives before the profile is known reaches it.
+    assert!(stderr(&out).contains("Gradle sync failed") && stderr(&out).contains("server log: /tmp/fake.log"), "stderr: {}", stderr(&out));
+    let status = status_stdout(&ws);
+    assert!(status.contains("profile:     kotlin-lsp") && status.contains("server log:  /tmp/fake.log"), "{status}");
+}
+
+#[test]
+fn the_profile_can_be_forced_off_or_on() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    // Calls itself kotlin-lsp, but the profile is turned off.
+    let off = Workspace::new("forced-off");
+    let out = off.start_fake(&["--server-profile", "generic"], &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", KOTLIN_NAME)]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(status_stdout(&off).contains("profile:     generic"));
+
+    // Does not say what it is, but the profile is asked for by name.
+    let on = Workspace::new("forced-on");
+    let out = on.start_fake(&["--server-profile", "kotlin-lsp"], &[("FAKE_LSP_INTELLIJ", "1")]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(status_stdout(&on).contains("profile:     kotlin-lsp"));
+}
+
+#[test]
+fn an_unknown_profile_name_is_rejected_before_anything_starts() {
+    let ws = Workspace::new("bad-profile");
+    let out = ws.run(&["--server-profile", "bogus", "session", "status"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("unknown server profile 'bogus'"), "stderr: {}", stderr(&out));
+}
+
