@@ -27,7 +27,7 @@ lsp-client query definition        <file> <line> <col>
 lsp-client query references        <file> <line> <col>
 lsp-client query symbols           <file>
 lsp-client query workspace-symbols <query>
-lsp-client query diagnostics       <file>
+lsp-client query diagnostics       <file> [--all]
 lsp-client query completion        <file> <line> <col>
 lsp-client query signature-help    <file> <line> <col>
 lsp-client query code-action       <file> <line> <col>
@@ -161,6 +161,8 @@ Pass `--tcp` to bypass the daemon entirely and connect directly to a TCP languag
 ## Known limitations
 
 **Android projects:** kotlin-lsp currently only supports JVM-only Kotlin Gradle projects out of the box. `workspace-symbols` returns empty results for Android projects. File-level commands (`symbols`, `hover`, `diagnostics`, etc.) work fine. Tracking issues: [#26](https://github.com/Kotlin/kotlin-lsp/issues/26), [#88](https://github.com/Kotlin/kotlin-lsp/issues/88).
+
+**Compose projects (kotlin-lsp):** `@Composable` function names are not reported as warnings. Compose names UI functions in UpperCase on purpose, and Android Studio does not warn about it, but kotlin-lsp reports `Function name 'Foo' should start with a lowercase letter` (inspection `FunctionName`) for every one. In text output, `query diagnostics` and `query context` leave out `FunctionName` diagnostics when the function is annotated `@Composable`. This also covers the qualified `@androidx.compose.runtime.Composable` and annotations spread over several lines; it does not match `@ComposableTarget` and similar. Naming warnings on other functions are still shown. Pass `--all` to `query diagnostics` to see everything the server reported. `--json` always returns the server's answer unfiltered.
 
 ## Alternatives
 

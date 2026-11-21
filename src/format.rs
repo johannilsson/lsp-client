@@ -116,7 +116,61 @@ pub fn format_capabilities(caps: &Value) -> String {
     if lines.is_empty() { "No capabilities reported.".into() } else { lines.join("\n") }
 }
 
+/// Decode `%XX` escapes (as in a URI query string).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Rewrite markdown links whose target is an editor `command:` URI, which no
+/// CLI caller can follow.  kotlin-lsp's `command:jetbrains.navigateToLocation?
+/// ["<uri>",line,col]` becomes `text (path:line:col)` (1-based); any other
+/// command link is reduced to its text.
+fn strip_command_links(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(i) = rest.find("](command:") {
+        let (Some(open), Some(close)) = (rest[..i].rfind('['), rest[i..].find(')').map(|j| i + j)) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..i]);
+        let target = &rest[i + 2..close];
+        if let Some(args) = target.strip_prefix("command:jetbrains.navigateToLocation?")
+            && let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&percent_decode(args))
+            && let (Some(uri), Some(line), Some(col)) = (
+                a.first().and_then(|v| v.as_str()),
+                a.get(1).and_then(|v| v.as_u64()),
+                a.get(2).and_then(|v| v.as_u64()),
+            )
+        {
+            out.push_str(&format!(" ({}:{}:{})", uri_to_path(uri), line + 1, col + 1));
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn format_hover(resp: &Value) -> String {
+    strip_command_links(&format_hover_raw(resp))
+}
+
+fn format_hover_raw(resp: &Value) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No hover information found.".into();
     };
@@ -218,7 +272,17 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
     if arr.is_empty() {
         return "No symbols found.".into();
     }
+    // kotlin-lsp can list the same declaration once per source set that
+    // contains it, and again from the project's own compiled classes jar under
+    // build/intermediates/ (Android). Show each source declaration once.
+    let mut seen = std::collections::HashSet::new();
+    let is_own_build_output = |s: &&Value| {
+        let uri = s["location"]["uri"].as_str().unwrap_or("");
+        uri.starts_with("jar:") && uri.contains("/build/intermediates/")
+    };
     arr.iter()
+        .filter(|s| !is_own_build_output(s))
+        .filter(|s| seen.insert((s["name"].to_string(), s["kind"].to_string(), s["location"].to_string())))
         .map(|s| {
             let kind = symbol_kind(s["kind"].as_u64().unwrap_or(0));
             let name = s["name"].as_str().unwrap_or("?");
@@ -231,7 +295,54 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
         .join("\n")
 }
 
-pub fn format_diagnostics(resp: &Value) -> String {
+/// True if `text` contains a `@Composable` annotation (plain or qualified,
+/// e.g. `@androidx.compose.runtime.Composable`), but not `@ComposableTarget`
+/// and the like.
+fn mentions_composable(text: &str) -> bool {
+    const NAME: &str = "Composable";
+    text.match_indices(NAME).any(|(i, _)| {
+        let before = &text[..i];
+        let after = text[i + NAME.len()..].chars().next();
+        let boundary = after.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let annotated = before.contains('@') && (before.ends_with('@') || before.ends_with('.'));
+        boundary && annotated
+    })
+}
+
+/// Whether the declaration starting at 0-based `line`/`col` of `source` is
+/// annotated `@Composable`: on the same line before `col`, or in the
+/// annotation lines directly above it.  Annotations can span lines
+/// (`@OptIn(\n Foo::class\n)`), so the walk upwards continues until a blank
+/// line, the end of a previous declaration or block (`{`, `}`, `;`) or the end
+/// of a comment, for at most 12 lines.
+fn is_composable_declaration(source: &str, line: usize, col: usize) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let Some(&decl) = lines.get(line) else {
+        return false;
+    };
+    let prefix_end = decl.char_indices().nth(col).map_or(decl.len(), |(i, _)| i);
+    if mentions_composable(&decl[..prefix_end]) {
+        return true;
+    }
+    for above in lines[..line].iter().rev().take(12) {
+        let t = above.trim();
+        if t.is_empty() || t.ends_with(['{', '}', ';']) || t.ends_with("*/") || t.starts_with("//") {
+            return false;
+        }
+        if mentions_composable(t) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Diagnostics as text.
+///
+/// `source` is the file's text.  With it, and unless `show_all` is set,
+/// `FunctionName` warnings on `@Composable` functions are left out: Compose
+/// names such functions in UpperCase on purpose, and Android Studio does not
+/// report them, but kotlin-lsp does.  Every other diagnostic is kept.
+pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No diagnostics.".into();
     };
@@ -242,6 +353,20 @@ pub fn format_diagnostics(resp: &Value) -> String {
     } else {
         return "No diagnostics.".into();
     };
+    let is_composable_name = |d: &&Value| {
+        if show_all || d["code"].as_str() != Some("FunctionName") {
+            return false;
+        }
+        let (Some(src), Some(line), Some(col)) = (
+            source,
+            d["range"]["start"]["line"].as_u64(),
+            d["range"]["start"]["character"].as_u64(),
+        ) else {
+            return false;
+        };
+        is_composable_declaration(src, line as usize, col as usize)
+    };
+    let items: Vec<&Value> = items.iter().filter(|d| !is_composable_name(d)).collect();
     if items.is_empty() {
         return "No diagnostics.".into();
     }
@@ -366,7 +491,9 @@ pub fn format_rename(resp: &Value) -> String {
     if lines.is_empty() { "No changes.".into() } else { lines.join("\n") }
 }
 
-// Semantic token types in the order kotlin-lsp declares them
+// Fallback legend, used only when the server's initialize response carries
+// none (the order kotlin-lsp 262.x declared).  The server's own legend from
+// `semanticTokensProvider.legend` takes precedence.
 const TOKEN_TYPES: &[&str] = &[
     "namespace", "class", "enum", "interface", "struct", "typeParameter",
     "type", "parameter", "variable", "property", "enumMember", "event",
@@ -378,7 +505,17 @@ const TOKEN_MODIFIERS: &[&str] = &[
     "abstract", "async", "modification", "documentation", "defaultLibrary",
 ];
 
-pub fn format_semantic_tokens(resp: &Value) -> String {
+pub fn format_semantic_tokens(resp: &Value, caps: &Value) -> String {
+    let legend = &caps["semanticTokensProvider"]["legend"];
+    let from_legend = |key: &str, fallback: &[&str]| -> Vec<String> {
+        match legend[key].as_array() {
+            Some(a) => a.iter().map(|v| v.as_str().unwrap_or("unknown").to_string()).collect(),
+            None => fallback.iter().map(|s| s.to_string()).collect(),
+        }
+    };
+    let token_types = from_legend("tokenTypes", TOKEN_TYPES);
+    let token_modifiers = from_legend("tokenModifiers", TOKEN_MODIFIERS);
+
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No semantic tokens.".into();
     };
@@ -404,10 +541,10 @@ pub fn format_semantic_tokens(resp: &Value) -> String {
         cur_line += delta_line;
         cur_start = if delta_line > 0 { delta_start } else { cur_start + delta_start };
 
-        let type_name = TOKEN_TYPES.get(token_type).copied().unwrap_or("unknown");
-        let mods: Vec<&str> = (0..TOKEN_MODIFIERS.len())
+        let type_name = token_types.get(token_type).map_or("unknown", |s| s.as_str());
+        let mods: Vec<&str> = (0..token_modifiers.len().min(64))
             .filter(|&i| token_mods & (1 << i) != 0)
-            .map(|i| TOKEN_MODIFIERS[i])
+            .map(|i| token_modifiers[i].as_str())
             .collect();
         let mods_str = if mods.is_empty() { String::new() } else { format!(" ({})", mods.join(", ")) };
         lines.push(format!(
@@ -456,7 +593,7 @@ fn completion_kind(kind: u64) -> &'static str {
     }
 }
 
-pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value) -> String {
+pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value, source: Option<&str>) -> String {
     let mut out = String::new();
 
     // Hover
@@ -508,7 +645,7 @@ pub fn format_context(hover: &Value, definition: &Value, references: &Value, dia
     // Diagnostics
     let diag_text = match diagnostics.get("result").filter(|v| !v.is_null()) {
         Some(_) => {
-            let s = format_diagnostics(diagnostics);
+            let s = format_diagnostics(diagnostics, source, false);
             if s == "No diagnostics." { None } else { Some(s) }
         }
         None => None,
@@ -557,4 +694,94 @@ pub fn format_completion(resp: &Value) -> String {
         lines.push(format!("... and {} more", items.len() - 30));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn navigate_link_becomes_path() {
+        let md = "From class: [`a.B`](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%2FB.java%22%2C5%2C19%5D)\nmore";
+        assert_eq!(strip_command_links(md), "From class: `a.B` (/x/B.java:6:20)\nmore");
+    }
+
+    #[test]
+    fn other_command_link_keeps_text_and_normal_links_stay() {
+        let md = "[run](command:foo?x) and [docs](https://example.com)";
+        assert_eq!(strip_command_links(md), "run and [docs](https://example.com)");
+    }
+
+    fn function_name_warning(line: u64, col: u64) -> Value {
+        json!({"code": "FunctionName", "severity": 2,
+               "message": "Function name 'Foo' should start with a lowercase letter",
+               "range": {"start": {"line": line, "character": col}, "end": {"line": line, "character": col + 3}}})
+    }
+
+    fn diag_text(items: Vec<Value>, source: &str, all: bool) -> String {
+        format_diagnostics(&json!({"result": {"items": items}}), Some(source), all)
+    }
+
+    #[test]
+    fn composable_function_names_are_not_reported() {
+        let src = "@Composable\nfun Foo() {}\n";
+        assert_eq!(diag_text(vec![function_name_warning(1, 4)], src, false), "No diagnostics.");
+        // …unless asked for.
+        assert!(diag_text(vec![function_name_warning(1, 4)], src, true).contains("Foo"));
+    }
+
+    #[test]
+    fn composable_detection_covers_common_layouts() {
+        for src in [
+            "@Composable fun Foo() {}",
+            "@Composable\n@OptIn(ExperimentalFoo::class)\nfun Foo() {}",
+            "@OptIn(\n    ExperimentalFoo::class,\n)\n@Composable\nfun Foo() {}",
+            "@androidx.compose.runtime.Composable\nprivate fun Foo() {}",
+            "@Composable()\ninternal fun Foo() {}",
+        ] {
+            let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
+            let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
+            assert_eq!(diag_text(vec![function_name_warning(line as u64, col)], src, false), "No diagnostics.", "{src}");
+        }
+    }
+
+    #[test]
+    fn other_function_name_warnings_are_kept() {
+        for src in [
+            "fun Foo() {}",
+            // The annotation belongs to the previous function.
+            "@Composable\nfun a() {\n}\nfun Foo() {}",
+            // Similar names are not @Composable.
+            "@ComposableTarget(\"x\")\nfun Foo() {}",
+            "// @Composable\nfun Foo() {}",
+        ] {
+            let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
+            let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
+            assert!(diag_text(vec![function_name_warning(line as u64, col)], src, false).contains("Foo"), "{src}");
+        }
+    }
+
+    #[test]
+    fn composable_filter_leaves_other_diagnostics_alone() {
+        let src = "@Composable\nfun Foo() {}\n";
+        let other = json!({"code": "SomethingElse", "severity": 2, "message": "unused",
+                           "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}});
+        let out = diag_text(vec![function_name_warning(1, 4), other], src, false);
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("unused"));
+        // Without the source we cannot tell, so nothing is hidden.
+        let no_src = format_diagnostics(&json!({"result": {"items": [function_name_warning(1, 4)]}}), None, false);
+        assert!(no_src.contains("Foo"));
+    }
+
+    #[test]
+    fn workspace_symbols_are_deduplicated() {
+        let sym = json!({"name": "f", "kind": 12, "containerName": "p",
+            "location": {"uri": "file:///a.kt", "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 5}}}});
+        let mut own_jar = sym.clone();
+        own_jar["location"]["uri"] = json!("jar:///p/app/build/intermediates/x/classes.jar!/AKt.class");
+        let out = format_workspace_symbols(&json!({"result": [sym.clone(), sym, own_jar]}));
+        assert_eq!(out.lines().count(), 1, "{out}");
+    }
 }
