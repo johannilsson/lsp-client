@@ -43,6 +43,8 @@ pub struct LspSession {
     opened_versions: HashMap<String, u32>,
     /// Tracks the mtime at which each URI was last sent to the server.
     opened_mtimes: HashMap<String, SystemTime>,
+    /// Sent as `initializationOptions` by `initialize` (`[initialization_options]` in the config file).
+    init_options: Option<Value>,
 }
 
 fn file_uri(path: &str) -> String {
@@ -60,6 +62,7 @@ impl LspSession {
             last_idle_result: None,
             opened_versions: HashMap::new(),
             opened_mtimes: HashMap::new(),
+            init_options: None,
         }
     }
 
@@ -124,10 +127,15 @@ impl LspSession {
         self.transport.send_raw(&msg.to_string())
     }
 
+    /// Options to send as `initializationOptions` in `initialize`.
+    pub fn set_initialization_options(&mut self, options: Option<Value>) {
+        self.init_options = options;
+    }
+
     pub fn initialize(&mut self, root: &str) -> Result<Value> {
         let root_uri = file_uri(root);
         let basename = Path::new(root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let resp = self.request("initialize", json!({
+        let mut params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -162,7 +170,11 @@ impl LspSession {
                 "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
-        }))?;
+        });
+        if let Some(opts) = &self.init_options {
+            params["initializationOptions"] = opts.clone();
+        }
+        let resp = self.request("initialize", params)?;
         self.notify("initialized", json!({}))?;
         Ok(resp)
     }
