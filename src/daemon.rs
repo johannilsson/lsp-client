@@ -84,6 +84,23 @@ struct ImportState {
     failures: Vec<String>,
 }
 
+impl ImportState {
+    /// For `lsp-client/status`: `"none"` if the server never announced an
+    /// import (most servers), `"running"` while one is in progress, `"problem"`
+    /// if the last one left a folder not imported, otherwise `"ok"`.
+    fn state(&self) -> &'static str {
+        if !self.expected {
+            "none"
+        } else if !self.finished {
+            "running"
+        } else if !self.failures.is_empty() {
+            "problem"
+        } else {
+            "ok"
+        }
+    }
+}
+
 /// Human-readable explanation of why a folder was not imported.  `status` and
 /// `message` come from `intellij/workspaceImportState` (`FAILED` or
 /// `BLOCKED`); for blocked folders `message` is the reason id and
@@ -377,6 +394,21 @@ fn handle_connection(
             Some("lsp-client/stop") => {
                 // Signal to the main loop that the daemon should shut down.
                 return true;
+            }
+            Some("lsp-client/status") => {
+                // Messages the server sent while no client was connected are
+                // still queued; take them into account before answering.
+                while let Ok(queued) = core.server_rx.try_recv() {
+                    core.observe(&queued);
+                }
+                let result = json!({
+                    "import": {
+                        "state": core.import.state(),
+                        "problems": core.import.failures,
+                    },
+                });
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
+                let _ = send_framed(&mut writer, &resp);
             }
             Some("lsp-client/waitIdle") => {
                 // Block until the server finishes all in-progress work, then
@@ -747,6 +779,18 @@ mod tests {
         // Unknown reasons are shown as they are rather than hidden.
         let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[]);
         assert!(other.contains("somethingNew"), "{other}");
+    }
+
+    #[test]
+    fn import_state_follows_the_server_notifications() {
+        let mut st = ImportState::default();
+        assert_eq!(st.state(), "none", "a server that never announces an import");
+        st.expected = true;
+        assert_eq!(st.state(), "running");
+        st.finished = true;
+        assert_eq!(st.state(), "ok");
+        st.failures.push("project not imported for /p/".into());
+        assert_eq!(st.state(), "problem");
     }
 
     #[test]

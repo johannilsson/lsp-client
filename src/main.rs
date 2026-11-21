@@ -7,7 +7,7 @@ mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::{IdleResult, LspSession, WaitOutcome};
+use session::{DaemonStatus, IdleResult, LspSession, WaitOutcome};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
@@ -345,6 +345,7 @@ fn main() {
                     Some(info) if info.is_alive() => {
                         let uptime =
                             format_uptime(unix_timestamp().saturating_sub(info.started_at));
+                        let daemon = fetch_daemon_status(&info.socket);
                         if cli.json {
                             println!(
                                 "{}",
@@ -356,6 +357,10 @@ fn main() {
                                     "language_id": info.language_id,
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
+                                    "import": daemon.as_ref().map(|d| serde_json::json!({
+                                        "state":    d.import_state,
+                                        "problems": d.import_problems,
+                                    })),
                                 })
                             );
                         } else {
@@ -365,6 +370,19 @@ fn main() {
                             println!("server:      {}", info.server);
                             println!("language_id: {}", info.language_id);
                             println!("uptime:      {uptime}");
+                            match &daemon {
+                                Some(d) => {
+                                    let label = match d.import_state.as_str() {
+                                        "none" => "n/a (the server does not report project imports)",
+                                        other => other,
+                                    };
+                                    println!("import:      {label}");
+                                    for p in &d.import_problems {
+                                        println!("             {p}");
+                                    }
+                                }
+                                None => println!("import:      unknown (the daemon did not answer)"),
+                            }
                         }
                     }
                     Some(_) => {
@@ -619,7 +637,6 @@ fn main() {
                 if !outcome.idle && cli.verbose {
                     eprintln!("[DEBUG] server still busy after {wait_dur:?}; querying anyway");
                 }
-                outcome.warn_import_failures();
                 // Restore the configured timeout for subsequent queries.
                 session.transport.set_read_timeout(effective.timeout);
             }
@@ -777,6 +794,18 @@ fn main() {
         Ok(())
     })();
 
+    // After a query against a daemon, say so if the project was not imported (or is
+    // still being imported): an empty answer then does not mean there is nothing to
+    // find.  On stderr, so the answer on stdout (and `--json`) is unchanged.
+    if use_daemon && result.is_ok() && matches!(cli.command, Command::Query { .. }) {
+        session.transport.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        if let Some(status) = session.daemon_status() {
+            for warning in status.query_warnings() {
+                eprintln!("{warning}");
+            }
+        }
+    }
+
     // In daemon mode: just drop the session (EOF → daemon loops back to accept).
     // In direct mode: send shutdown + exit cleanly.
     if !use_daemon {
@@ -915,6 +944,20 @@ fn start_daemon(
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// Ask the daemon at `socket` for its project import state, waiting a few
+/// seconds at most (it answers between clients, so a busy daemon may not).
+#[cfg(unix)]
+fn fetch_daemon_status(socket: &str) -> Option<DaemonStatus> {
+    let transport = Transport::unix_socket(socket).ok()?;
+    transport.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    LspSession::new(transport, false, None).daemon_status()
+}
+
+#[cfg(not(unix))]
+fn fetch_daemon_status(_socket: &str) -> Option<DaemonStatus> {
+    None
 }
 
 /// Connect to the daemon, optionally open a file to trigger indexing, then
