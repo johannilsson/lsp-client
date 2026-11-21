@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod format;
+mod servers;
 mod session;
 mod session_file;
 mod transport;
@@ -63,6 +64,10 @@ struct Cli {
     /// answers that question (the server remembers the answer for the workspace)
     #[arg(long, global = true, value_name = "TOOL")]
     build_tool: Option<String>,
+    /// Behaviour specific to one server: auto (default: chosen from what the server calls
+    /// itself), generic (none), or kotlin-lsp
+    #[arg(long, global = true, value_name = "NAME")]
+    server_profile: Option<String>,
 
     /// Maximum time to wait for a response (e.g. 10s, 2m). Default: no timeout.
     #[arg(long, global = true, value_parser = parse_duration)]
@@ -236,6 +241,7 @@ struct EffectiveConfig {
     language_id: Option<String>,
     no_server_stdio_flag: bool,
     build_tool: Option<String>,
+    server_profile: Option<String>,
     timeout: Option<std::time::Duration>,
 }
 
@@ -279,6 +285,7 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         no_server_stdio_flag: cli.no_server_stdio_flag
             || file_config.no_server_stdio_flag.unwrap_or(false),
         build_tool: cli.build_tool.clone().or(file_config.build_tool),
+        server_profile: cli.server_profile.clone().or(file_config.server_profile),
         timeout,
     }
 }
@@ -287,6 +294,12 @@ fn main() {
     let cli = Cli::parse();
     let effective = build_effective_config(&cli);
     let root = &effective.root;
+    if let Some(name) = &effective.server_profile
+        && let Err(e) = servers::select(Some(name), None)
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(2);
+    }
 
     // ---- Session management commands (no LSP session needed) ---------------
 
@@ -351,6 +364,7 @@ fn main() {
                                     "language_id": info.language_id,
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
+                                    "profile":     info.profile,
                                 })
                             );
                         } else {
@@ -360,6 +374,9 @@ fn main() {
                             println!("server:      {}", info.server);
                             println!("language_id: {}", info.language_id);
                             println!("uptime:      {uptime}");
+                            if !info.profile.is_empty() {
+                                println!("profile:     {}", info.profile);
+                            }
                         }
                     }
                     Some(_) => {
@@ -433,7 +450,10 @@ fn main() {
                     *idle_timeout,
                     cli.verbose,
                     language_id,
-                    effective.build_tool.as_deref(),
+                    daemon::DaemonOptions {
+                        build_tool: effective.build_tool.clone(),
+                        profile: effective.server_profile.clone(),
+                    },
                 ) {
                     eprintln!("daemon error: {e}");
                     std::process::exit(1);
@@ -870,6 +890,9 @@ fn start_daemon(
     }
     if let Some(tool) = &effective.build_tool {
         cmd.arg("--build-tool").arg(tool);
+    }
+    if let Some(profile) = &effective.server_profile {
+        cmd.arg("--server-profile").arg(profile);
     }
     if verbose {
         cmd.arg("--verbose");
