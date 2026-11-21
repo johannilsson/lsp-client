@@ -14,6 +14,62 @@ pub enum IdleResult {
     ServerSilent,
 }
 
+/// Answer to `lsp-client/waitIdle`.
+pub struct WaitOutcome {
+    /// The server became idle before the deadline.
+    pub idle: bool,
+    /// Folders whose project import (e.g. kotlin-lsp's Gradle sync) failed:
+    /// queries in them will return little or nothing.
+    pub import_failures: Vec<String>,
+}
+
+impl WaitOutcome {
+    /// Print a warning to stderr if the project import failed.
+    pub fn warn_import_failures(&self) {
+        for f in &self.import_failures {
+            eprintln!("Warning: {f}");
+        }
+    }
+}
+
+/// Answer to `lsp-client/status`: what the daemon knows about the project import.
+#[derive(Debug, Default, PartialEq)]
+pub struct DaemonStatus {
+    /// `"none"` (the server doesn't report imports), `"running"`, `"ok"` or `"problem"`.
+    pub import_state: String,
+    /// One message per folder that was not imported, when `import_state` is `"problem"`.
+    pub import_problems: Vec<String>,
+}
+
+impl DaemonStatus {
+    pub fn from_result(result: &Value) -> Self {
+        DaemonStatus {
+            import_state: result["import"]["state"].as_str().unwrap_or("none").to_owned(),
+            import_problems: result["import"]["problems"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
+        }
+    }
+
+    /// Warnings to show next to a query's answer: an empty answer from a
+    /// project that was not imported (or is still being imported) does not
+    /// mean there is nothing to find.
+    pub fn query_warnings(&self) -> Vec<String> {
+        match self.import_state.as_str() {
+            "problem" => self.import_problems.iter().map(|p| format!("Warning: {p}")).collect(),
+            "running" => vec![
+                "Warning: the project import is still running, so results may be incomplete \
+                 (`lsp-client session wait-ready` waits for it)."
+                    .to_owned(),
+            ],
+            _ => Vec::new(),
+        }
+    }
+}
+
 pub struct LspSession {
     pub transport: Transport,
     next_id: u64,
@@ -25,6 +81,8 @@ pub struct LspSession {
     opened_versions: HashMap<String, u32>,
     /// Tracks the mtime at which each URI was last sent to the server.
     opened_mtimes: HashMap<String, SystemTime>,
+    /// Sent as `initializationOptions` by `initialize` (`[initialization_options]` in the config file).
+    init_options: Option<Value>,
 }
 
 fn file_uri(path: &str) -> String {
@@ -42,6 +100,7 @@ impl LspSession {
             last_idle_result: None,
             opened_versions: HashMap::new(),
             opened_mtimes: HashMap::new(),
+            init_options: None,
         }
     }
 
@@ -106,10 +165,25 @@ impl LspSession {
         self.transport.send_raw(&msg.to_string())
     }
 
+    /// Ask the daemon for its project import state.  `None` if the daemon does
+    /// not answer (older version, or busy past the read timeout).
+    pub fn daemon_status(&mut self) -> Option<DaemonStatus> {
+        let resp = self.request("lsp-client/status", json!({})).ok()?;
+        if resp.get("error").is_some_and(|e| !e.is_null()) {
+            return None;
+        }
+        Some(DaemonStatus::from_result(&resp["result"]))
+    }
+
+    /// Options to send as `initializationOptions` in `initialize`.
+    pub fn set_initialization_options(&mut self, options: Option<Value>) {
+        self.init_options = options;
+    }
+
     pub fn initialize(&mut self, root: &str) -> Result<Value> {
         let root_uri = file_uri(root);
         let basename = Path::new(root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let resp = self.request("initialize", json!({
+        let mut params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -144,7 +218,11 @@ impl LspSession {
                 "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
-        }))?;
+        });
+        if let Some(opts) = &self.init_options {
+            params["initializationOptions"] = opts.clone();
+        }
+        let resp = self.request("initialize", params)?;
         self.notify("initialized", json!({}))?;
         Ok(resp)
     }
@@ -231,8 +309,25 @@ impl LspSession {
     /// Send a `lsp-client/waitIdle` request to the daemon and block until it
     /// responds (i.e., until the underlying LSP server is idle).  Only
     /// meaningful in daemon mode; in direct TCP mode prefer `wait_for_index`.
-    pub fn wait_idle_request(&mut self) -> Result<Value> {
-        self.request("lsp-client/waitIdle", json!({}))
+    /// Ask the daemon to block until the server is idle, for at most `max_wait`.
+    pub fn wait_idle_request(&mut self, max_wait: Duration) -> Result<WaitOutcome> {
+        // Leave the socket read timeout a little longer than the daemon's own
+        // deadline so we receive its "timeout" answer rather than an I/O error.
+        self.transport.set_read_timeout(Some(max_wait + Duration::from_secs(10)));
+        let resp = self.request(
+            "lsp-client/waitIdle",
+            json!({"timeoutMs": max_wait.as_millis() as u64}),
+        )?;
+        let result = &resp["result"];
+        // Older daemons answer with a bare string.
+        let status = result["status"].as_str().or_else(|| result.as_str()).unwrap_or("idle");
+        let import_failures = result["importFailures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        Ok(WaitOutcome { idle: status != "timeout", import_failures })
     }
 
     /// Read and discard incoming messages until the server goes quiet and all
@@ -407,5 +502,36 @@ impl LspSession {
     pub fn shutdown(mut self) {
         let _ = self.request("shutdown", json!({}));
         let _ = self.notify("exit", json!({}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_is_parsed_from_the_daemon_answer() {
+        let st = DaemonStatus::from_result(&json!({
+            "import": {"state": "problem", "problems": ["project not imported for /p/: no supported build system"]}
+        }));
+        assert_eq!(st.import_state, "problem");
+        assert_eq!(st.import_problems.len(), 1);
+        // An answer without an import section means the server doesn't report one.
+        assert_eq!(DaemonStatus::from_result(&json!({})).import_state, "none");
+    }
+
+    #[test]
+    fn queries_warn_only_when_the_answer_cannot_be_trusted() {
+        let problem = DaemonStatus {
+            import_state: "problem".into(),
+            import_problems: vec!["project not imported for /p/".into()],
+        };
+        assert_eq!(problem.query_warnings(), vec!["Warning: project not imported for /p/".to_string()]);
+        let running = DaemonStatus { import_state: "running".into(), import_problems: vec![] };
+        assert!(running.query_warnings()[0].contains("still running"));
+        for quiet in ["ok", "none"] {
+            let st = DaemonStatus { import_state: quiet.into(), import_problems: vec![] };
+            assert!(st.query_warnings().is_empty(), "{quiet}");
+        }
     }
 }

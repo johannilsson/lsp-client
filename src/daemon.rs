@@ -18,6 +18,7 @@
 //! time.  This is correct for LSP (which is already sequential in practice)
 //! and avoids needing an async runtime.
 
+use crate::servers::{self, ServerFacts, ServerProfile};
 use crate::session_file::{unix_timestamp, SessionInfo};
 use crate::transport::MessageReader;
 use serde_json::{json, Value};
@@ -56,11 +57,49 @@ struct DaemonCore {
     /// Used to convert a repeat textDocument/didOpen into textDocument/didChange
     /// so the server sees updated content without a protocol violation.
     opened_versions: HashMap<String, u32>,
+    /// `$/progress` tokens that have begun (or been created) but not ended.
+    /// Kept across calls: servers such as kotlin-lsp run a Gradle import that
+    /// can stay silent for minutes while its token is still open.
+    pending_progress: HashSet<Value>,
+    /// Server-specific behaviour (see `servers`). Generic until the server has
+    /// answered `initialize` and told us what it is.
+    profile: Box<dyn ServerProfile>,
+    /// What the profile has learned about the server, e.g. that it is importing a
+    /// project. Stays empty for servers whose profile knows nothing to record.
+    facts: ServerFacts,
+    /// Notifications that arrived before the profile was chosen, to hand to it once
+    /// it is. `None` once that has happened.
+    early: Option<Vec<Value>>,
+    /// Answer for the server's "which build tool?" question (`--build-tool`), for the
+    /// profiles whose server asks one.
+    build_tool: Option<String>,
+}
+
+/// Answer to a server-initiated request that no profile answered.
+/// `workspace/configuration` needs one entry per requested item; everything else
+/// (`window/workDoneProgress/create`, `client/registerCapability`, ...) takes `null`.
+fn server_request_result(method: &str, params: &Value) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let n = params["items"].as_array().map_or(0, |a| a.len());
+            Value::Array(vec![Value::Null; n])
+        }
+        _ => Value::Null,
+    }
 }
 
 impl DaemonCore {
     fn send_raw(&mut self, msg: &Value) -> io::Result<()> {
         send_framed(self.server_writer.as_mut(), msg)
+    }
+
+    /// Switch to `profile` (chosen after `initialize`), and let it see the
+    /// notifications the server sent before we knew which profile to use.
+    fn use_profile(&mut self, profile: Box<dyn ServerProfile>) {
+        self.profile = profile;
+        for msg in self.early.take().unwrap_or_default() {
+            self.profile.on_message(&msg, &mut self.facts);
+        }
     }
 
     /// Send a JSON-RPC request to the server and return its response.
@@ -76,17 +115,7 @@ impl DaemonCore {
         }
         loop {
             let resp = self.server_rx.recv().map_err(|_| "server reader thread died")?;
-            if let Some(m) = resp.get("method").and_then(|v| v.as_str()) {
-                // Server-initiated request: ack it; notification: discard.
-                if resp.get("id").is_some() {
-                    if self.verbose {
-                        eprintln!("[DAEMON] <<< server request: {m} — acking");
-                    }
-                    let ack = json!({"jsonrpc":"2.0","id":resp["id"],"result":null});
-                    let _ = self.send_raw(&ack);
-                } else if self.verbose {
-                    eprintln!("[DAEMON] <<< notification: {m}");
-                }
+            if self.observe(&resp) {
                 continue;
             }
             if resp.get("id") == Some(&json!(id)) {
@@ -103,75 +132,110 @@ impl DaemonCore {
         self.send_raw(&msg)
     }
 
-    /// Drain server messages until the server goes quiet and all in-progress
-    /// work tokens are complete.  Mirrors the logic in LspSession::wait_for_idle.
-    fn wait_for_idle(&mut self) {
-        let mut pending: HashSet<Value> = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut last_activity = Instant::now();
+    /// Handle a server-initiated message (request or notification): ack
+    /// requests and track `$/progress` state.  Returns `true` if `msg` was a
+    /// server-initiated message, `false` if it is a response to one of ours.
+    fn observe(&mut self, msg: &Value) -> bool {
+        let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if let Some(early) = &mut self.early
+            && msg.get("id").is_none()
+        {
+            early.push(msg.clone());
+        }
+        self.profile.on_message(msg, &mut self.facts);
+        match method {
+            // A created token only counts once it begins: kotlin-lsp creates
+            // tokens and then cancels the create request without using them.
+            "window/workDoneProgress/create" => {}
+            "$/progress" => {
+                let token = &msg["params"]["token"];
+                let kind = msg["params"]["value"]["kind"].as_str().unwrap_or("");
+                match kind {
+                    "begin" => {
+                        self.pending_progress.insert(token.clone());
+                    }
+                    "end" => {
+                        self.pending_progress.remove(token);
+                    }
+                    _ => {}
+                }
+                if self.verbose {
+                    let v = &msg["params"]["value"];
+                    let text = v["title"].as_str().or_else(|| v["message"].as_str()).unwrap_or("");
+                    let pct = v["percentage"].as_u64().map(|p| format!(" {p}%")).unwrap_or_default();
+                    eprintln!(
+                        "[DAEMON] $/progress {kind}{pct} {text} (pending: {})",
+                        self.pending_progress.len()
+                    );
+                }
+            }
+            _ => {
+                if self.verbose {
+                    let params = msg["params"].to_string();
+                    let cut = params.char_indices().nth(400).map_or(params.len(), |(i, _)| i);
+                    eprintln!("[DAEMON] <<< {method} {}", &params[..cut]);
+                }
+            }
+        }
+        if let Some(id) = msg.get("id") {
+            let result = self
+                .profile
+                .answer_request(method, &msg["params"], self.build_tool.as_deref())
+                .unwrap_or_else(|| server_request_result(method, &msg["params"]));
+            if self.verbose && method == "window/showMessageRequest" {
+                eprintln!("[DAEMON] answering {method} with {result}");
+            }
+            let ack = json!({"jsonrpc":"2.0","id":id,"result":result});
+            let _ = self.send_raw(&ack);
+        }
+        true
+    }
 
+    /// Drain server messages until the server is idle, or `max_wait` elapses.
+    ///
+    /// `strict == false` ("settle"): return once the server has been quiet for
+    /// 500 ms with no open progress tokens, or quiet for 2 s even with open
+    /// tokens.  Used after didOpen/didChange so queries are not held up for the
+    /// whole of a long background import.
+    ///
+    /// `strict == true`: return only once every progress token has ended and
+    /// the server has been quiet for 500 ms, or, if it leaves a token open, quiet
+    /// for 2 s, unless it announced a project import that is still running.
+    /// Used by `lsp-client/waitIdle`.
+    ///
+    /// Returns `true` if idle was reached, `false` on timeout.
+    fn wait_for_idle(&mut self, max_wait: Duration, strict: bool) -> bool {
+        let deadline = Instant::now() + max_wait;
+        let mut last_activity = Instant::now();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                break;
+                return false;
             }
-            let timeout = remaining.min(Duration::from_millis(500));
-            match self.server_rx.recv_timeout(timeout) {
+            match self.server_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
                 Ok(msg) => {
                     last_activity = Instant::now();
-                    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                    match method {
-                        "window/workDoneProgress/create" => {
-                            if let Some(token) = msg["params"].get("token") {
-                                pending.insert(token.clone());
-                            }
-                            if let Some(id) = msg.get("id") {
-                                let ack = json!({"jsonrpc":"2.0","id":id,"result":null});
-                                let _ = self.send_raw(&ack);
-                            }
-                            if self.verbose {
-                                eprintln!(
-                                    "[DAEMON] progress token registered (pending: {})",
-                                    pending.len()
-                                );
-                            }
-                        }
-                        "$/progress" => {
-                            let token = &msg["params"]["token"];
-                            match msg["params"]["value"]["kind"].as_str().unwrap_or("") {
-                                "begin" => {
-                                    pending.insert(token.clone());
-                                }
-                                "end" => {
-                                    pending.remove(token);
-                                }
-                                _ => {}
-                            }
-                            if self.verbose {
-                                eprintln!(
-                                    "[DAEMON] $/progress {} (pending: {})",
-                                    msg["params"]["value"]["kind"]
-                                        .as_str()
-                                        .unwrap_or("?"),
-                                    pending.len()
-                                );
-                            }
-                        }
-                        _ => {
-                            if self.verbose && !method.is_empty() {
-                                eprintln!("[DAEMON] notification: {method}");
-                            }
-                        }
-                    }
+                    self.observe(&msg);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // Break if server is quiet with no outstanding tokens, OR if tokens
-                    // exist but the server has gone silent (server forgot to send "end").
-                    if pending.is_empty() || last_activity.elapsed() >= Duration::from_secs(2) {
-                        break;
+                    let quiet = last_activity.elapsed();
+                    let import_running = self.facts.import.expected && !self.facts.import.finished;
+                    let idle = self.pending_progress.is_empty()
+                        && !import_running
+                        && quiet >= Duration::from_millis(500);
+                    // Some servers never end a progress token, so a server that has gone
+                    // quiet for 2 s counts as done even with one still open.  The one
+                    // exception is a project import the server announced and has not
+                    // finished (kotlin-lsp's Gradle sync): that is waited for, however
+                    // quiet it is, until `max_wait`.
+                    let quiet_done = quiet >= Duration::from_secs(2) && !(strict && import_running);
+                    if idle || quiet_done {
+                        return true;
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
     }
@@ -244,11 +308,34 @@ fn handle_connection(
                 // Signal to the main loop that the daemon should shut down.
                 return true;
             }
+            Some("lsp-client/status") => {
+                // Messages the server sent while no client was connected are
+                // still queued; take them into account before answering.
+                while let Ok(queued) = core.server_rx.try_recv() {
+                    core.observe(&queued);
+                }
+                let result = json!({
+                    "import": {
+                        "state": core.facts.import.state(),
+                        "problems": core.facts.import.failures,
+                    },
+                });
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
+                let _ = send_framed(&mut writer, &resp);
+            }
             Some("lsp-client/waitIdle") => {
                 // Block until the server finishes all in-progress work, then
                 // respond so the caller knows it's safe to query.
-                core.wait_for_idle();
-                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":"idle"});
+                let max_wait = msg["params"]["timeoutMs"]
+                    .as_u64()
+                    .map(Duration::from_millis)
+                    .unwrap_or(Duration::from_secs(300));
+                let idle = core.wait_for_idle(max_wait, true);
+                let result = json!({
+                    "status": if idle { "idle" } else { "timeout" },
+                    "importFailures": core.facts.import.failures,
+                });
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
                 let _ = send_framed(&mut writer, &resp);
             }
 
@@ -306,7 +393,7 @@ fn handle_connection(
                 // by this notification (e.g., indexing after didOpen/didChange).
                 // The client is already waiting for its next response, so this
                 // delay is invisible to it.
-                core.wait_for_idle();
+                core.wait_for_idle(Duration::from_secs(60), false);
             }
 
             // ------------------------------------------------------------------
@@ -326,17 +413,9 @@ fn handle_connection(
                         Err(_) => return true, // server reader thread died
                     };
 
-                    if server_msg.get("method").is_some() {
-                        // Server-initiated request: ack internally, never forward.
-                        if server_msg.get("id").is_some() {
-                            let ack = json!({
-                                "jsonrpc": "2.0",
-                                "id": server_msg["id"],
-                                "result": null,
-                            });
-                            let _ = core.send_raw(&ack);
-                        }
-                        // Notifications from server while waiting: discard.
+                    // Server-initiated messages are acked/tracked internally,
+                    // never forwarded to the CLI client.
+                    if core.observe(&server_msg) {
                         continue;
                     }
 
@@ -354,6 +433,17 @@ fn handle_connection(
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Settings that only matter to the daemon process.
+#[derive(Default)]
+pub struct DaemonOptions {
+    /// Answer for the server's "which build tool?" question (`--build-tool`).
+    pub build_tool: Option<String>,
+    /// `initializationOptions` for `initialize` (`[initialization_options]` in the config file).
+    pub initialization_options: Option<Value>,
+    /// Server profile asked for by name (`--server-profile`); `None` means auto.
+    pub profile: Option<String>,
+}
+
 /// Run the daemon process.  This function blocks until the daemon shuts down
 /// (idle timeout, server crash, or explicit stop request).
 pub fn run_daemon(
@@ -363,6 +453,7 @@ pub fn run_daemon(
     idle_secs: u64,
     verbose: bool,
     language_id: &str,
+    options: DaemonOptions,
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
@@ -401,6 +492,11 @@ pub fn run_daemon(
         next_id: 1,
         verbose,
         opened_versions: HashMap::new(),
+        pending_progress: HashSet::new(),
+        profile: servers::generic(),
+        facts: ServerFacts::default(),
+        early: Some(Vec::new()),
+        build_tool: options.build_tool.clone(),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -418,9 +514,7 @@ pub fn run_daemon(
         eprintln!("[DAEMON] initialising {server_bin} for {canonical_root}");
     }
 
-    let init_resp = core.request(
-        "initialize",
-        json!({
+    let mut init_params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -459,11 +553,21 @@ pub fn run_daemon(
                 "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
-        }),
-    )?;
+    });
+    if let Some(opts) = &options.initialization_options {
+        init_params["initializationOptions"] = opts.clone();
+    }
+    let init_resp = core.request("initialize", init_params)?;
+
+    // Now the server has said what it is, choose its profile (see `servers`).
+    let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
+    core.use_profile(servers::select(options.profile.as_deref(), server_name)?);
+    if verbose {
+        eprintln!("[DAEMON] server profile: {}", core.profile.name());
+    }
 
     core.notify("initialized", json!({}))?;
-    core.wait_for_idle();
+    core.wait_for_idle(Duration::from_secs(60), false);
 
     let init_result = init_resp
         .get("result")
@@ -488,6 +592,8 @@ pub fn run_daemon(
         socket: socket_path.clone(),
         started_at: unix_timestamp(),
         initialized: true,
+        server_log: core.facts.server_log.clone(),
+        profile: core.profile.name().to_owned(),
     };
     info.save()?;
 
@@ -552,4 +658,70 @@ pub fn run_daemon(
 
     eprintln!("[DAEMON] stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn core_for_test() -> DaemonCore {
+        let (_tx, rx) = mpsc::channel();
+        DaemonCore {
+            server_writer: Box::new(io::sink()),
+            server_rx: rx,
+            next_id: 1,
+            verbose: false,
+            opened_versions: HashMap::new(),
+            pending_progress: HashSet::new(),
+            profile: servers::generic(),
+            facts: ServerFacts::default(),
+            early: Some(Vec::new()),
+            build_tool: None,
+        }
+    }
+
+    fn failed_import() -> Value {
+        json!({"jsonrpc": "2.0", "method": "intellij/workspaceImportState", "params": {
+            "phase": "FINISHED",
+            "folders": [{"folderUri": "file:///p/", "message": "Gradle sync failed", "status": "FAILED"}],
+        }})
+    }
+
+    #[test]
+    fn what_arrives_before_the_profile_is_known_is_replayed_to_it() {
+        let mut core = core_for_test();
+        // Sent while `initialize` is still being answered: nobody knows the server yet.
+        core.observe(&failed_import());
+        assert!(core.facts.import.failures.is_empty());
+        core.use_profile(servers::by_name("kotlin-lsp").unwrap());
+        assert_eq!(core.facts.import.failures.len(), 1);
+        assert!(core.early.is_none());
+    }
+
+    #[test]
+    fn nothing_reaches_the_facts_of_a_server_without_a_profile() {
+        let mut core = core_for_test();
+        core.observe(&failed_import());
+        core.use_profile(servers::generic());
+        core.observe(&failed_import());
+        assert!(!core.facts.import.expected && core.facts.import.failures.is_empty());
+    }
+
+    #[test]
+    fn the_default_answers_to_server_requests() {
+        // `workspace/configuration` needs one entry per requested item.
+        let cfg = json!({"items": [{}, {}]});
+        assert_eq!(server_request_result("workspace/configuration", &cfg), json!([null, null]));
+        for method in ["window/workDoneProgress/create", "client/registerCapability", "window/showMessageRequest"] {
+            assert_eq!(server_request_result(method, &json!({})), Value::Null, "{method}");
+        }
+    }
+
+    #[test]
+    fn requests_from_the_server_are_not_replayed() {
+        // Only notifications are kept; a request has an id and is answered on the spot.
+        let mut core = core_for_test();
+        core.observe(&json!({"jsonrpc": "2.0", "id": 7, "method": "intellij/workspaceImportState", "params": {}}));
+        assert_eq!(core.early.as_ref().map(Vec::len), Some(0));
+    }
 }

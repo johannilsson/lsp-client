@@ -1,13 +1,14 @@
 mod config;
 mod daemon;
 mod format;
+mod servers;
 mod session;
 mod session_file;
 mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::{IdleResult, LspSession};
+use session::{DaemonStatus, IdleResult, LspSession, WaitOutcome};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
@@ -57,6 +58,16 @@ struct Cli {
     /// Do not pass --stdio to the server process (e.g. sourcekit-lsp uses stdio by default)
     #[arg(long, global = true)]
     no_server_stdio_flag: bool,
+
+    /// Build tool to import the project with when it has more than one, e.g. gradle or maven.
+    /// kotlin-lsp asks which to use when a folder has both a Gradle and a Maven build; this
+    /// answers that question (the server remembers the answer for the workspace)
+    #[arg(long, global = true, value_name = "TOOL")]
+    build_tool: Option<String>,
+    /// Behaviour specific to one server: auto (default: chosen from what the server calls
+    /// itself), generic (none), or kotlin-lsp
+    #[arg(long, global = true, value_name = "NAME")]
+    server_profile: Option<String>,
 
     /// Maximum time to wait for a response (e.g. 10s, 2m). Default: no timeout.
     #[arg(long, global = true, value_parser = parse_duration)]
@@ -209,6 +220,14 @@ enum SessionCommand {
     /// Stop the running LSP session daemon for this workspace.
     Stop,
 
+    /// Print the end of the language server's own log file (for servers that
+    /// announce one, such as kotlin-lsp). `session status` shows the path.
+    Log {
+        /// Number of lines to print
+        #[arg(long, short = 'n', default_value_t = 50)]
+        lines: usize,
+    },
+
     /// Wait until the LSP server has finished indexing (no pending progress).
     ///
     /// Useful in scripts: `lsp-client session wait-ready && lsp-client query hover ...`
@@ -235,6 +254,10 @@ struct EffectiveConfig {
     server: Option<String>,
     language_id: Option<String>,
     no_server_stdio_flag: bool,
+    build_tool: Option<String>,
+    /// `[initialization_options]` from the config file, as JSON.
+    initialization_options: Option<serde_json::Value>,
+    server_profile: Option<String>,
     timeout: Option<std::time::Duration>,
 }
 
@@ -277,6 +300,11 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         language_id: cli.language_id.clone().or(file_config.language_id),
         no_server_stdio_flag: cli.no_server_stdio_flag
             || file_config.no_server_stdio_flag.unwrap_or(false),
+        build_tool: cli.build_tool.clone().or(file_config.build_tool),
+        initialization_options: file_config
+            .initialization_options
+            .and_then(|v| serde_json::to_value(v).ok()),
+        server_profile: cli.server_profile.clone().or(file_config.server_profile),
         timeout,
     }
 }
@@ -285,6 +313,12 @@ fn main() {
     let cli = Cli::parse();
     let effective = build_effective_config(&cli);
     let root = &effective.root;
+    if let Some(name) = &effective.server_profile
+        && let Err(e) = servers::select(Some(name), None)
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(2);
+    }
 
     // ---- Session management commands (no LSP session needed) ---------------
 
@@ -304,16 +338,31 @@ fn main() {
                             .language_id
                             .as_deref()
                             .unwrap_or(&info.language_id);
-                        if let Err(e) = wait_for_daemon_ready(
+                        // The daemon keeps running either way; the exit code
+                        // matches `session wait-ready` (2 = timed out,
+                        // 3 = project import failed).
+                        match wait_for_daemon_ready(
                             &info.socket,
                             wait_file.as_deref(),
                             lang,
                             cli.verbose,
                             effective.timeout,
                         ) {
-                            eprintln!("Warning: wait-for-idle failed: {e}");
-                        } else {
-                            eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            Err(e) => {
+                                eprintln!("Warning: wait-for-idle failed: {e}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.idle => {
+                                eprintln!("Warning: server still busy (indexing not finished) for {root}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.import_failures.is_empty() => {
+                                outcome.warn_import_failures();
+                                std::process::exit(3);
+                            }
+                            Ok(_) => {
+                                eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            }
                         }
                     }
                 return;
@@ -323,6 +372,7 @@ fn main() {
                     Some(info) if info.is_alive() => {
                         let uptime =
                             format_uptime(unix_timestamp().saturating_sub(info.started_at));
+                        let daemon = fetch_daemon_status(&info.socket);
                         if cli.json {
                             println!(
                                 "{}",
@@ -334,6 +384,12 @@ fn main() {
                                     "language_id": info.language_id,
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
+                                    "server_log":  info.server_log,
+                                    "import": daemon.as_ref().map(|d| serde_json::json!({
+                                        "state":    d.import_state,
+                                        "problems": d.import_problems,
+                                    })),
+                                    "profile":     info.profile,
                                 })
                             );
                         } else {
@@ -343,13 +399,38 @@ fn main() {
                             println!("server:      {}", info.server);
                             println!("language_id: {}", info.language_id);
                             println!("uptime:      {uptime}");
+                            if !info.profile.is_empty() {
+                                println!("profile:     {}", info.profile);
+                            }
+                            if let Some(log) = &info.server_log {
+                                println!("server log:  {log}");
+                            }
+                            match &daemon {
+                                Some(d) => {
+                                    let label = match d.import_state.as_str() {
+                                        "none" => "n/a (the server does not report project imports)",
+                                        other => other,
+                                    };
+                                    println!("import:      {label}");
+                                    for p in &d.import_problems {
+                                        println!("             {p}");
+                                    }
+                                }
+                                None => println!("import:      unknown (the daemon did not answer)"),
+                            }
                         }
                     }
-                    Some(_) => {
+                    Some(info) => {
                         if cli.json {
-                            println!("{}", serde_json::json!({"status": "dead"}));
+                            println!(
+                                "{}",
+                                serde_json::json!({"status": "dead", "server_log": info.server_log})
+                            );
                         } else {
                             eprintln!("status:      dead (stale session)");
+                            if let Some(log) = &info.server_log {
+                                eprintln!("server log:  {log}");
+                            }
                         }
                         std::process::exit(1);
                     }
@@ -410,10 +491,39 @@ fn main() {
                     std::process::exit(1);
                 });
                 if let Err(e) = daemon::run_daemon(
-                    root, server, server_args, *idle_timeout, cli.verbose, language_id,
+                    root,
+                    server,
+                    server_args,
+                    *idle_timeout,
+                    cli.verbose,
+                    language_id,
+                    daemon::DaemonOptions {
+                        build_tool: effective.build_tool.clone(),
+                        initialization_options: effective.initialization_options.clone(),
+                        profile: effective.server_profile.clone(),
+                    },
                 ) {
                     eprintln!("daemon error: {e}");
                     std::process::exit(1);
+                }
+                return;
+            }
+            SessionCommand::Log { lines } => {
+                let log = SessionInfo::load(root).and_then(|i| i.server_log);
+                match log {
+                    Some(path) => match tail_lines(&path, *lines) {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => {
+                            eprintln!("Cannot read the server log {path}: {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        eprintln!(
+                            "No server log known for {root}: no daemon is running, or the server does not announce a log file."
+                        );
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }
@@ -497,6 +607,7 @@ fn main() {
         });
 
     let mut session = LspSession::new(transport, cli.verbose, effective.timeout);
+    session.set_initialization_options(effective.initialization_options.clone());
 
     // --wait-for-index: use a longer timeout in direct TCP mode; in daemon mode
     // we send lsp-client/waitIdle after did_open (below).
@@ -520,9 +631,15 @@ fn main() {
             &cli.command
         {
             if use_daemon {
-                // Set a generous read timeout so we can wait a long time.
-                session.transport.set_read_timeout(Some(*wait_timeout));
-                session.wait_idle_request()?;
+                let outcome = session.wait_idle_request(*wait_timeout)?;
+                if !outcome.idle {
+                    eprintln!("Timed out waiting for server to become idle.");
+                    std::process::exit(2);
+                }
+                if !outcome.import_failures.is_empty() {
+                    outcome.warn_import_failures();
+                    std::process::exit(3);
+                }
             } else {
                 session.wait_for_index(*wait_timeout);
                 if matches!(session.last_idle_result, Some(IdleResult::TimedOut)) {
@@ -577,8 +694,10 @@ fn main() {
             if cli.wait_for_index && use_daemon {
                 let wait_dur =
                     effective.timeout.unwrap_or(std::time::Duration::from_secs(300));
-                session.transport.set_read_timeout(Some(wait_dur));
-                session.wait_idle_request()?;
+                let outcome = session.wait_idle_request(wait_dur)?;
+                if !outcome.idle && cli.verbose {
+                    eprintln!("[DEBUG] server still busy after {wait_dur:?}; querying anyway");
+                }
                 // Restore the configured timeout for subsequent queries.
                 session.transport.set_read_timeout(effective.timeout);
             }
@@ -750,6 +869,18 @@ fn main() {
         Ok(())
     })();
 
+    // After a query against a daemon, say so if the project was not imported (or is
+    // still being imported): an empty answer then does not mean there is nothing to
+    // find.  On stderr, so the answer on stdout (and `--json`) is unchanged.
+    if use_daemon && result.is_ok() && matches!(cli.command, Command::Query { .. }) {
+        session.transport.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        if let Some(status) = session.daemon_status() {
+            for warning in status.query_warnings() {
+                eprintln!("{warning}");
+            }
+        }
+    }
+
     // In daemon mode: just drop the session (EOF → daemon loops back to accept).
     // In direct mode: send shutdown + exit cleanly.
     if !use_daemon {
@@ -820,8 +951,10 @@ fn connect_or_start_daemon(
 }
 
 /// Spawn `lsp-client session daemon-run` as a background process and block
-/// until the session file appears (daemon has finished initialising), or 30 s
-/// elapse.
+/// until the session file appears (daemon has finished initialising), or the
+/// configured `--timeout` (at least 30 s) elapses.  JVM-based servers such as
+/// kotlin-lsp can take longer than 30 s just to answer `initialize` on a large
+/// Gradle/Android workspace.
 fn start_daemon(
     effective: &EffectiveConfig,
     verbose: bool,
@@ -848,6 +981,12 @@ fn start_daemon(
     if effective.no_server_stdio_flag {
         cmd.arg("--no-server-stdio-flag");
     }
+    if let Some(tool) = &effective.build_tool {
+        cmd.arg("--build-tool").arg(tool);
+    }
+    if let Some(profile) = &effective.server_profile {
+        cmd.arg("--server-profile").arg(profile);
+    }
     if verbose {
         cmd.arg("--verbose");
     }
@@ -860,25 +999,72 @@ fn start_daemon(
     cmd.stdout(Stdio::null());
     cmd.stderr(if verbose { Stdio::inherit() } else { Stdio::null() });
 
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
     // Poll for the session file to appear — this means the daemon has
     // successfully initialised the LSP server and is ready to accept clients.
     let root = &effective.root;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let max_wait = effective
+        .timeout
+        .unwrap_or_default()
+        .max(std::time::Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + max_wait;
     loop {
         if SessionInfo::load(root).map(|i| i.initialized).unwrap_or(false) {
             return Ok(());
         }
+        // A daemon that has exited (typically because the language server failed to
+        // start) will never become ready: say so now rather than after `max_wait`,
+        // which follows `--timeout` and can be minutes.
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "the daemon exited ({status}) before it was ready; the language server probably failed to start (check that '{server}' runs, or use '{} --verbose session start' to see its output)",
+                exe.display()
+            )
+            .into());
+        }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "daemon did not become ready within 30 s (check '{} --verbose session start')",
+                "daemon did not become ready within {max_wait:?} (raise --timeout, or check '{} --verbose session start')",
                 exe.display()
             )
             .into());
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// The last `n` lines of the file at `path`, reading only its end.
+fn tail_lines(path: &str, n: usize) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let window = 256 * 1024;
+    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // If we started mid-file, the first line is probably cut off.
+    if len > window && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(n);
+    Ok(lines[start..].iter().map(|l| format!("{l}\n")).collect())
+}
+
+/// Ask the daemon at `socket` for its project import state, waiting a few
+/// seconds at most (it answers between clients, so a busy daemon may not).
+#[cfg(unix)]
+fn fetch_daemon_status(socket: &str) -> Option<DaemonStatus> {
+    let transport = Transport::unix_socket(socket).ok()?;
+    transport.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    LspSession::new(transport, false, None).daemon_status()
+}
+
+#[cfg(not(unix))]
+fn fetch_daemon_status(_socket: &str) -> Option<DaemonStatus> {
+    None
 }
 
 /// Connect to the daemon, optionally open a file to trigger indexing, then
@@ -890,19 +1076,17 @@ fn wait_for_daemon_ready(
     language_id: &str,
     verbose: bool,
     timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
+    let max_wait = timeout.unwrap_or(std::time::Duration::from_secs(300));
     let transport = Transport::unix_socket(socket)?;
-    if let Some(dur) = timeout.or(Some(std::time::Duration::from_secs(300))) {
-        transport.set_read_timeout(Some(dur));
-    }
+    transport.set_read_timeout(Some(max_wait));
     let mut session = LspSession::new(transport, verbose, timeout);
     // No initialize needed — daemon has the cached result.
     if let Some(f) = wait_file {
         let abs = abs_path(f);
         session.did_open(&abs, language_id)?;
     }
-    session.wait_idle_request()?;
-    Ok(())
+    session.wait_idle_request(max_wait)
 }
 
 #[cfg(not(unix))]
@@ -912,7 +1096,7 @@ fn wait_for_daemon_ready(
     _language_id: &str,
     _verbose: bool,
     _timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
     Err("Unix sockets not available on this platform".into())
 }
 
@@ -993,4 +1177,25 @@ fn print_json(resp: &serde_json::Value) {
         "error":  resp.get("error"),
     });
     println!("{}", out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_lines_returns_the_end_of_a_file() {
+        let path = std::env::temp_dir().join(format!("lsp-client-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(tail_lines(p, 2).unwrap(), "three\nfour\n");
+        assert_eq!(tail_lines(p, 10).unwrap(), "one\ntwo\nthree\nfour\n");
+        assert_eq!(tail_lines(p, 0).unwrap(), "");
+        // A file bigger than the read window: the cut-off first line is dropped.
+        let big: String = (0..40_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &big).unwrap();
+        assert_eq!(tail_lines(p, 2).unwrap(), "line 39998\nline 39999\n");
+        let _ = std::fs::remove_file(&path);
+        assert!(tail_lines(p, 1).is_err());
+    }
 }
