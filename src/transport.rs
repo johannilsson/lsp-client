@@ -154,7 +154,7 @@ impl Transport {
                     .spawn()
                     .map_err(|e| {
                         if e.kind() == io::ErrorKind::NotFound {
-                            format!("Error: '{bin}' not found. Is it installed, and on your PATH?")
+                            format!("'{bin}' not found. Is it installed, and on your PATH?")
                         } else {
                             e.to_string()
                         }
@@ -201,7 +201,7 @@ impl Transport {
             .spawn()
             .map_err(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
-                    format!("Error: '{server_bin}' not found. Is it installed, and on your PATH?")
+                    format!("'{server_bin}' not found. Is it installed, and on your PATH?")
                 } else {
                     e.to_string()
                 }
