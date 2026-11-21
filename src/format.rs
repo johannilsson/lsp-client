@@ -366,7 +366,9 @@ pub fn format_rename(resp: &Value) -> String {
     if lines.is_empty() { "No changes.".into() } else { lines.join("\n") }
 }
 
-// Semantic token types in the order kotlin-lsp declares them
+// Fallback legend, used only when the server's initialize response carries
+// none (the order kotlin-lsp 262.x declared).  The server's own legend from
+// `semanticTokensProvider.legend` takes precedence.
 const TOKEN_TYPES: &[&str] = &[
     "namespace", "class", "enum", "interface", "struct", "typeParameter",
     "type", "parameter", "variable", "property", "enumMember", "event",
@@ -378,7 +380,17 @@ const TOKEN_MODIFIERS: &[&str] = &[
     "abstract", "async", "modification", "documentation", "defaultLibrary",
 ];
 
-pub fn format_semantic_tokens(resp: &Value) -> String {
+pub fn format_semantic_tokens(resp: &Value, caps: &Value) -> String {
+    let legend = &caps["semanticTokensProvider"]["legend"];
+    let from_legend = |key: &str, fallback: &[&str]| -> Vec<String> {
+        match legend[key].as_array() {
+            Some(a) => a.iter().map(|v| v.as_str().unwrap_or("unknown").to_string()).collect(),
+            None => fallback.iter().map(|s| s.to_string()).collect(),
+        }
+    };
+    let token_types = from_legend("tokenTypes", TOKEN_TYPES);
+    let token_modifiers = from_legend("tokenModifiers", TOKEN_MODIFIERS);
+
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No semantic tokens.".into();
     };
@@ -404,10 +416,10 @@ pub fn format_semantic_tokens(resp: &Value) -> String {
         cur_line += delta_line;
         cur_start = if delta_line > 0 { delta_start } else { cur_start + delta_start };
 
-        let type_name = TOKEN_TYPES.get(token_type).copied().unwrap_or("unknown");
-        let mods: Vec<&str> = (0..TOKEN_MODIFIERS.len())
+        let type_name = token_types.get(token_type).map_or("unknown", |s| s.as_str());
+        let mods: Vec<&str> = (0..token_modifiers.len().min(64))
             .filter(|&i| token_mods & (1 << i) != 0)
-            .map(|i| TOKEN_MODIFIERS[i])
+            .map(|i| token_modifiers[i].as_str())
             .collect();
         let mods_str = if mods.is_empty() { String::new() } else { format!(" ({})", mods.join(", ")) };
         lines.push(format!(

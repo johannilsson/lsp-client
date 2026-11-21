@@ -681,7 +681,7 @@ fn main() {
                     if cli.json {
                         print_json(&resp)
                     } else {
-                        println!("{}", format_semantic_tokens(&resp))
+                        println!("{}", format_semantic_tokens(&resp, &init_resp["result"]["capabilities"]))
                     }
                 }
                 QueryCommand::InlayHints { file, start_line, end_line } => {
@@ -802,8 +802,10 @@ fn connect_or_start_daemon(
 }
 
 /// Spawn `lsp-client session daemon-run` as a background process and block
-/// until the session file appears (daemon has finished initialising), or 30 s
-/// elapse.
+/// until the session file appears (daemon has finished initialising), or the
+/// configured `--timeout` (at least 30 s) elapses.  JVM-based servers such as
+/// kotlin-lsp can take longer than 30 s just to answer `initialize` on a large
+/// Gradle/Android workspace.
 fn start_daemon(
     effective: &EffectiveConfig,
     verbose: bool,
@@ -847,14 +849,18 @@ fn start_daemon(
     // Poll for the session file to appear — this means the daemon has
     // successfully initialised the LSP server and is ready to accept clients.
     let root = &effective.root;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let max_wait = effective
+        .timeout
+        .unwrap_or_default()
+        .max(std::time::Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + max_wait;
     loop {
         if SessionInfo::load(root).map(|i| i.initialized).unwrap_or(false) {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "daemon did not become ready within 30 s (check '{} --verbose session start')",
+                "daemon did not become ready within {max_wait:?} (raise --timeout, or check '{} --verbose session start')",
                 exe.display()
             )
             .into());
