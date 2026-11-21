@@ -66,16 +66,76 @@ struct DaemonCore {
     /// after `initialized`, and may report no `$/progress` at all, so once a
     /// server has announced one, idle also requires the import to be finished.
     import: ImportState,
+    /// Answer for the server's "which build tool?" question (`--build-tool`).
+    build_tool: Option<String>,
 }
 
 #[derive(Default)]
 struct ImportState {
+    /// Folders the server could not import and why, from the latest
+    /// `intellij/workspaceImportStatus` (`blockedFolders`).
+    blocked: Vec<Value>,
     /// The server announced a project import.
     expected: bool,
     /// The server reported the import as finished (successfully or not).
     finished: bool,
-    /// One line per folder whose import failed, from the last finished import.
+    /// One message per folder that was not imported (failed or blocked), from
+    /// the last finished import.
     failures: Vec<String>,
+}
+
+/// Human-readable explanation of why a folder was not imported.  `status` and
+/// `message` come from `intellij/workspaceImportState` (`FAILED` or
+/// `BLOCKED`); for blocked folders `message` is the reason id and
+/// `candidates` are the build tools the server found.
+fn describe_import_problem(status: &str, folder: &str, message: &str, candidates: &[String]) -> String {
+    let path = folder.strip_prefix("file://").unwrap_or(folder);
+    if status != "BLOCKED" {
+        return format!(
+            "project import failed for {path}: {message}. Results will be incomplete; see the server log (--verbose prints its path)."
+        );
+    }
+    let why = match message {
+        "ambiguousBuildSystem" => format!(
+            "more than one build tool found ({}); choose one with --build-tool or `build_tool` in .lsp-client.toml",
+            candidates.join(", ")
+        ),
+        "noBuildSystemFound" => "no supported build system found in the project root".to_string(),
+        "noProjectInRoot" => "no project found in the root folder".to_string(),
+        "noProjectAtConfiguredPath" => "no project at the configured path".to_string(),
+        "cannotResolveConfiguredPath" | "cannotResolveFolderPath" => "the folder path could not be resolved".to_string(),
+        "unknownBuildTool" => "unknown build tool".to_string(),
+        other => other.to_string(),
+    };
+    format!("project not imported for {path}: {why}. Results will be limited to file-level queries.")
+}
+
+/// Answer to a server-initiated request.  `workspace/configuration` needs one
+/// entry per requested item.  `window/showMessageRequest` is a question with
+/// buttons: answer with the action whose title contains `build_tool`
+/// (kotlin-lsp's "Use Gradle" / "Use Maven"), or dismiss it.  Everything else
+/// (`window/workDoneProgress/create`, `client/registerCapability`, ...) takes
+/// `null`.
+fn server_request_result(method: &str, params: &Value, build_tool: Option<&str>) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let n = params["items"].as_array().map_or(0, |a| a.len());
+            Value::Array(vec![Value::Null; n])
+        }
+        "window/showMessageRequest" => {
+            let want = build_tool.map(str::to_lowercase).filter(|t| !t.is_empty());
+            let actions = params["actions"].as_array();
+            match (want, actions) {
+                (Some(want), Some(actions)) => actions
+                    .iter()
+                    .find(|a| a["title"].as_str().is_some_and(|t| t.to_lowercase().contains(&want)))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        }
+        _ => Value::Null,
+    }
 }
 
 impl DaemonCore {
@@ -128,6 +188,9 @@ impl DaemonCore {
                 if !self.import.finished {
                     self.import.expected = true;
                 }
+                if let Some(blocked) = msg["params"]["blockedFolders"].as_array() {
+                    self.import.blocked = blocked.clone();
+                }
                 if self.verbose {
                     eprintln!("[DAEMON] <<< {method} {}", msg["params"]);
                 }
@@ -137,16 +200,27 @@ impl DaemonCore {
                 self.import.expected = true;
                 self.import.finished = params["phase"].as_str() == Some("FINISHED");
                 if self.import.finished {
+                    let blocked = &self.import.blocked;
                     self.import.failures = params["folders"]
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .filter(|f| f["status"].as_str() == Some("FAILED"))
+                        .filter(|f| matches!(f["status"].as_str(), Some("FAILED" | "BLOCKED")))
                         .map(|f| {
-                            format!(
-                                "{}: {}",
-                                f["folderUri"].as_str().unwrap_or("?"),
-                                f["message"].as_str().unwrap_or("import failed")
+                            let folder = f["folderUri"].as_str().unwrap_or("?");
+                            let candidates: Vec<String> = blocked
+                                .iter()
+                                .find(|b| b["folderUri"].as_str() == Some(folder))
+                                .and_then(|b| b["candidates"].as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|c| c.as_str().map(str::to_owned))
+                                .collect();
+                            describe_import_problem(
+                                f["status"].as_str().unwrap_or("FAILED"),
+                                folder,
+                                f["message"].as_str().unwrap_or("import failed"),
+                                &candidates,
                             )
                         })
                         .collect();
@@ -186,7 +260,11 @@ impl DaemonCore {
             }
         }
         if let Some(id) = msg.get("id") {
-            let ack = json!({"jsonrpc":"2.0","id":id,"result":server_request_result(method, &msg["params"])});
+            let result = server_request_result(method, &msg["params"], self.build_tool.as_deref());
+            if self.verbose && method == "window/showMessageRequest" {
+                eprintln!("[DAEMON] answering {method} with {result}");
+            }
+            let ack = json!({"jsonrpc":"2.0","id":id,"result":result});
             let _ = self.send_raw(&ack);
         }
         true
@@ -230,20 +308,6 @@ impl DaemonCore {
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
-    }
-}
-
-/// Result to send for a server-initiated request.  `workspace/configuration`
-/// must be answered with one entry per requested item; everything else we
-/// receive (`window/workDoneProgress/create`, `client/registerCapability`, ...)
-/// takes `null`.
-fn server_request_result(method: &str, params: &Value) -> Value {
-    match method {
-        "workspace/configuration" => {
-            let n = params["items"].as_array().map_or(0, |a| a.len());
-            Value::Array(vec![Value::Null; n])
-        }
-        _ => Value::Null,
     }
 }
 
@@ -433,6 +497,7 @@ pub fn run_daemon(
     idle_secs: u64,
     verbose: bool,
     language_id: &str,
+    build_tool: Option<&str>,
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
@@ -473,6 +538,7 @@ pub fn run_daemon(
         opened_versions: HashMap::new(),
         pending_progress: HashSet::new(),
         import: ImportState::default(),
+        build_tool: build_tool.map(str::to_owned),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -624,4 +690,58 @@ pub fn run_daemon(
 
     eprintln!("[DAEMON] stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buttons() -> Value {
+        json!({"actions": [{"title": "Use Gradle"}, {"title": "Use Maven"}, {"title": "Configure…"}]})
+    }
+
+    #[test]
+    fn build_tool_answers_the_matching_button() {
+        let r = server_request_result("window/showMessageRequest", &buttons(), Some("maven"));
+        assert_eq!(r, json!({"title": "Use Maven"}));
+        // Case-insensitive.
+        let r = server_request_result("window/showMessageRequest", &buttons(), Some("Gradle"));
+        assert_eq!(r, json!({"title": "Use Gradle"}));
+    }
+
+    #[test]
+    fn question_without_a_matching_choice_is_dismissed() {
+        assert_eq!(server_request_result("window/showMessageRequest", &buttons(), None), Value::Null);
+        assert_eq!(server_request_result("window/showMessageRequest", &buttons(), Some("bazel")), Value::Null);
+        assert_eq!(server_request_result("window/showMessageRequest", &buttons(), Some("")), Value::Null);
+    }
+
+    #[test]
+    fn other_requests_keep_their_answers() {
+        let cfg = json!({"items": [{}, {}]});
+        assert_eq!(server_request_result("workspace/configuration", &cfg, Some("gradle")), json!([null, null]));
+        assert_eq!(server_request_result("window/workDoneProgress/create", &json!({}), None), Value::Null);
+    }
+
+    #[test]
+    fn blocked_folders_are_explained() {
+        let amb = describe_import_problem(
+            "BLOCKED",
+            "file:///p/amb/",
+            "ambiguousBuildSystem",
+            &["gradle".to_string(), "maven".to_string()],
+        );
+        assert!(amb.contains("/p/amb/") && amb.contains("gradle, maven") && amb.contains("--build-tool"), "{amb}");
+        let none = describe_import_problem("BLOCKED", "file:///p/x/", "noBuildSystemFound", &[]);
+        assert!(none.contains("no supported build system"), "{none}");
+        // Unknown reasons are shown as they are rather than hidden.
+        let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[]);
+        assert!(other.contains("somethingNew"), "{other}");
+    }
+
+    #[test]
+    fn failed_imports_point_at_the_server_log() {
+        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[]);
+        assert!(f.contains("/p/app/") && f.contains("Gradle sync failed") && f.contains("server log"), "{f}");
+    }
 }
