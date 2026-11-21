@@ -105,10 +105,15 @@ lsp-client session start
 ### kotlin-lsp (Kotlin)
 
 ```sh
+# macOS
 brew install JetBrains/utils/kotlin-lsp
+# Linux/Windows: download the standalone archive from
+# https://github.com/Kotlin/kotlin-lsp/releases, unpack it and put bin/intellij-server
+# on PATH as kotlin-lsp
 
-# Recommended: daemon over stdio (starts once, serves all subsequent calls from a warm session)
-lsp-client session start --server kotlin-lsp --language-id kotlin --root /my/project
+# Recommended: daemon over stdio (starts once, serves all subsequent calls from a warm session).
+# The first Gradle import of a project can take a minute or more: give --timeout room.
+lsp-client --timeout 10m session start --server kotlin-lsp --language-id kotlin --root /my/project --wait
 lsp-client query symbols src/Main.kt
 
 # Direct TCP: attach to a server already running on port 9999 (e.g. started by IntelliJ)
@@ -160,7 +165,22 @@ Pass `--tcp` to bypass the daemon entirely and connect directly to a TCP languag
 
 ## Known limitations
 
-**Android projects:** kotlin-lsp currently only supports JVM-only Kotlin Gradle projects out of the box. `workspace-symbols` returns empty results for Android projects. File-level commands (`symbols`, `hover`, `diagnostics`, etc.) work fine. Tracking issues: [#26](https://github.com/Kotlin/kotlin-lsp/issues/26), [#88](https://github.com/Kotlin/kotlin-lsp/issues/88).
+**Android projects (kotlin-lsp):** Android Gradle Plugin support in kotlin-lsp is experimental. Tested with kotlin-lsp 271.2085.0 on an AGP 9.5 / Gradle 9.8 app that uses a JVM-only `includeBuild`: once the Gradle sync succeeds, hover, definition, references, workspace symbols and diagnostics work, including across the included build and into library jars. Things to watch for:
+
+- **The whole sync can fail on a variant you don't use.** kotlin-lsp syncs every variant, including `release` ([#291](https://github.com/Kotlin/kotlin-lsp/issues/291)). With AGP 9's Compose Preview support, the `release` variant fails because AGP disables its unit tests by default. The project then gets no model at all: only `symbols` works, and `diagnostics` comes back silently empty. Look for `Gradle sync failed` in the server log (its path is printed at startup with `--verbose`). One workaround is to turn on host tests for `release` in `app/build.gradle.kts`:
+
+  ```kotlin
+  androidComponents {
+      beforeVariants(selector().withBuildType("release")) {
+          (it as com.android.build.api.variant.HasHostTestsBuilder)
+              .hostTests[com.android.build.api.variant.HostTestBuilder.UNIT_TEST_TYPE]?.enable = true
+      }
+  }
+  ```
+
+- **`BuildConfig` (and other generated sources) are not provided by the server** ([#253](https://github.com/Kotlin/kotlin-lsp/issues/253)). On a fresh clone they show up as `Unresolved reference` errors. Run `./gradlew :app:generateDebugBuildConfig` (or a build) *before* `session start`; files generated while the server runs are not picked up until a restart.
+- Use AGP 9 / Gradle 9: older combinations can import with empty source roots ([#241](https://github.com/Kotlin/kotlin-lsp/issues/241)).
+- Kotlin naming inspections flag every `@Composable` function name as a warning.
 
 ## Alternatives
 
