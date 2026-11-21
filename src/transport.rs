@@ -145,7 +145,7 @@ impl Transport {
                 if verbose {
                     eprintln!("[DEBUG] Connection refused, starting {bin}...");
                 }
-                eprintln!("kotlin-lsp server not running — starting it...");
+                eprintln!("No server listening on {host}:{port} — starting {bin}...");
 
                 Command::new(bin)
                     .args(["--socket", &format!("{host}:{port}"), "--multi-client"])
@@ -154,9 +154,7 @@ impl Transport {
                     .spawn()
                     .map_err(|e| {
                         if e.kind() == io::ErrorKind::NotFound {
-                            format!(
-                                "Error: '{bin}' not found. Install it with:\n  brew install JetBrains/utils/kotlin-lsp"
-                            )
+                            format!("Error: '{bin}' not found. Is it installed, and on your PATH?")
                         } else {
                             e.to_string()
                         }
@@ -203,9 +201,7 @@ impl Transport {
             .spawn()
             .map_err(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
-                    format!(
-                        "Error: '{server_bin}' not found. Install it with:\n  brew install JetBrains/utils/kotlin-lsp"
-                    )
+                    format!("Error: '{server_bin}' not found. Is it installed, and on your PATH?")
                 } else {
                     e.to_string()
                 }
