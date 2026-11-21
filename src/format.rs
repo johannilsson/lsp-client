@@ -369,7 +369,54 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
         .join("\n")
 }
 
-pub fn format_diagnostics(resp: &Value) -> String {
+/// True if `text` contains a `@Composable` annotation (plain or qualified,
+/// e.g. `@androidx.compose.runtime.Composable`), but not `@ComposableTarget`
+/// and the like.
+fn mentions_composable(text: &str) -> bool {
+    const NAME: &str = "Composable";
+    text.match_indices(NAME).any(|(i, _)| {
+        let before = &text[..i];
+        let after = text[i + NAME.len()..].chars().next();
+        let boundary = after.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let annotated = before.contains('@') && (before.ends_with('@') || before.ends_with('.'));
+        boundary && annotated
+    })
+}
+
+/// Whether the declaration starting at 0-based `line`/`col` of `source` is
+/// annotated `@Composable`: on the same line before `col`, or in the
+/// annotation lines directly above it.  Annotations can span lines
+/// (`@OptIn(\n Foo::class\n)`), so the walk upwards continues until a blank
+/// line, the end of a previous declaration or block (`{`, `}`, `;`) or the end
+/// of a comment, for at most 12 lines.
+fn is_composable_declaration(source: &str, line: usize, col: usize) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    let Some(&decl) = lines.get(line) else {
+        return false;
+    };
+    let prefix_end = decl.char_indices().nth(col).map_or(decl.len(), |(i, _)| i);
+    if mentions_composable(&decl[..prefix_end]) {
+        return true;
+    }
+    for above in lines[..line].iter().rev().take(12) {
+        let t = above.trim();
+        if t.is_empty() || t.ends_with(['{', '}', ';']) || t.ends_with("*/") || t.starts_with("//") {
+            return false;
+        }
+        if mentions_composable(t) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Diagnostics as text.
+///
+/// `source` is the file's text.  With it, and unless `show_all` is set,
+/// `FunctionName` warnings on `@Composable` functions are left out: Compose
+/// names such functions in UpperCase on purpose, and Android Studio does not
+/// report them, but kotlin-lsp does.  Every other diagnostic is kept.
+pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No diagnostics.".into();
     };
@@ -380,6 +427,20 @@ pub fn format_diagnostics(resp: &Value) -> String {
     } else {
         return "No diagnostics.".into();
     };
+    let is_composable_name = |d: &&Value| {
+        if show_all || d["code"].as_str() != Some("FunctionName") {
+            return false;
+        }
+        let (Some(src), Some(line), Some(col)) = (
+            source,
+            d["range"]["start"]["line"].as_u64(),
+            d["range"]["start"]["character"].as_u64(),
+        ) else {
+            return false;
+        };
+        is_composable_declaration(src, line as usize, col as usize)
+    };
+    let items: Vec<&Value> = items.iter().filter(|d| !is_composable_name(d)).collect();
     if items.is_empty() {
         return "No diagnostics.".into();
     }
@@ -606,7 +667,7 @@ fn completion_kind(kind: u64) -> &'static str {
     }
 }
 
-pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value) -> String {
+pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value, source: Option<&str>) -> String {
     let mut out = String::new();
 
     // Hover
@@ -658,7 +719,7 @@ pub fn format_context(hover: &Value, definition: &Value, references: &Value, dia
     // Diagnostics
     let diag_text = match diagnostics.get("result").filter(|v| !v.is_null()) {
         Some(_) => {
-            let s = format_diagnostics(diagnostics);
+            let s = format_diagnostics(diagnostics, source, false);
             if s == "No diagnostics." { None } else { Some(s) }
         }
         None => None,
@@ -724,6 +785,68 @@ mod tests {
     fn other_command_link_keeps_text_and_normal_links_stay() {
         let md = "[run](command:foo?x) and [docs](https://example.com)";
         assert_eq!(strip_command_links(md), "run and [docs](https://example.com)");
+    }
+
+    fn function_name_warning(line: u64, col: u64) -> Value {
+        json!({"code": "FunctionName", "severity": 2,
+               "message": "Function name 'Foo' should start with a lowercase letter",
+               "range": {"start": {"line": line, "character": col}, "end": {"line": line, "character": col + 3}}})
+    }
+
+    fn diag_text(items: Vec<Value>, source: &str, all: bool) -> String {
+        format_diagnostics(&json!({"result": {"items": items}}), Some(source), all)
+    }
+
+    #[test]
+    fn composable_function_names_are_not_reported() {
+        let src = "@Composable\nfun Foo() {}\n";
+        assert_eq!(diag_text(vec![function_name_warning(1, 4)], src, false), "No diagnostics.");
+        // …unless asked for.
+        assert!(diag_text(vec![function_name_warning(1, 4)], src, true).contains("Foo"));
+    }
+
+    #[test]
+    fn composable_detection_covers_common_layouts() {
+        for src in [
+            "@Composable fun Foo() {}",
+            "@Composable\n@OptIn(ExperimentalFoo::class)\nfun Foo() {}",
+            "@OptIn(\n    ExperimentalFoo::class,\n)\n@Composable\nfun Foo() {}",
+            "@androidx.compose.runtime.Composable\nprivate fun Foo() {}",
+            "@Composable()\ninternal fun Foo() {}",
+        ] {
+            let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
+            let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
+            assert_eq!(diag_text(vec![function_name_warning(line as u64, col)], src, false), "No diagnostics.", "{src}");
+        }
+    }
+
+    #[test]
+    fn other_function_name_warnings_are_kept() {
+        for src in [
+            "fun Foo() {}",
+            // The annotation belongs to the previous function.
+            "@Composable\nfun a() {\n}\nfun Foo() {}",
+            // Similar names are not @Composable.
+            "@ComposableTarget(\"x\")\nfun Foo() {}",
+            "// @Composable\nfun Foo() {}",
+        ] {
+            let line = src.lines().position(|l| l.contains("fun Foo")).unwrap();
+            let col = src.lines().nth(line).unwrap().find("Foo").unwrap() as u64;
+            assert!(diag_text(vec![function_name_warning(line as u64, col)], src, false).contains("Foo"), "{src}");
+        }
+    }
+
+    #[test]
+    fn composable_filter_leaves_other_diagnostics_alone() {
+        let src = "@Composable\nfun Foo() {}\n";
+        let other = json!({"code": "SomethingElse", "severity": 2, "message": "unused",
+                           "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}});
+        let out = diag_text(vec![function_name_warning(1, 4), other], src, false);
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("unused"));
+        // Without the source we cannot tell, so nothing is hidden.
+        let no_src = format_diagnostics(&json!({"result": {"items": [function_name_warning(1, 4)]}}), None, false);
+        assert!(no_src.contains("Foo"));
     }
 
     #[test]
