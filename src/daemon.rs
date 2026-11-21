@@ -56,6 +56,26 @@ struct DaemonCore {
     /// Used to convert a repeat textDocument/didOpen into textDocument/didChange
     /// so the server sees updated content without a protocol violation.
     opened_versions: HashMap<String, u32>,
+    /// `$/progress` tokens that have begun (or been created) but not ended.
+    /// Kept across calls: servers such as kotlin-lsp run a Gradle import that
+    /// can stay silent for minutes while its token is still open.
+    pending_progress: HashSet<Value>,
+    /// IntelliJ-based servers (kotlin-lsp) announce a project import with
+    /// `intellij/workspaceImportStatus` and report its outcome with
+    /// `intellij/workspaceImportState`.  The import can start several seconds
+    /// after `initialized`, and may report no `$/progress` at all, so once a
+    /// server has announced one, idle also requires the import to be finished.
+    import: ImportState,
+}
+
+#[derive(Default)]
+struct ImportState {
+    /// The server announced a project import.
+    expected: bool,
+    /// The server reported the import as finished (successfully or not).
+    finished: bool,
+    /// One line per folder whose import failed, from the last finished import.
+    failures: Vec<String>,
 }
 
 impl DaemonCore {
@@ -76,17 +96,7 @@ impl DaemonCore {
         }
         loop {
             let resp = self.server_rx.recv().map_err(|_| "server reader thread died")?;
-            if let Some(m) = resp.get("method").and_then(|v| v.as_str()) {
-                // Server-initiated request: ack it; notification: discard.
-                if resp.get("id").is_some() {
-                    if self.verbose {
-                        eprintln!("[DAEMON] <<< server request: {m} — acking");
-                    }
-                    let ack = json!({"jsonrpc":"2.0","id":resp["id"],"result":null});
-                    let _ = self.send_raw(&ack);
-                } else if self.verbose {
-                    eprintln!("[DAEMON] <<< notification: {m}");
-                }
+            if self.observe(&resp) {
                 continue;
             }
             if resp.get("id") == Some(&json!(id)) {
@@ -103,77 +113,137 @@ impl DaemonCore {
         self.send_raw(&msg)
     }
 
-    /// Drain server messages until the server goes quiet and all in-progress
-    /// work tokens are complete.  Mirrors the logic in LspSession::wait_for_idle.
-    fn wait_for_idle(&mut self) {
-        let mut pending: HashSet<Value> = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut last_activity = Instant::now();
+    /// Handle a server-initiated message (request or notification): ack
+    /// requests and track `$/progress` state.  Returns `true` if `msg` was a
+    /// server-initiated message, `false` if it is a response to one of ours.
+    fn observe(&mut self, msg: &Value) -> bool {
+        let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        match method {
+            // A created token only counts once it begins: kotlin-lsp creates
+            // tokens and then cancels the create request without using them.
+            "window/workDoneProgress/create" => {}
+            "intellij/workspaceImportStatus" => {
+                if !self.import.finished {
+                    self.import.expected = true;
+                }
+                if self.verbose {
+                    eprintln!("[DAEMON] <<< {method} {}", msg["params"]);
+                }
+            }
+            "intellij/workspaceImportState" => {
+                let params = &msg["params"];
+                self.import.expected = true;
+                self.import.finished = params["phase"].as_str() == Some("FINISHED");
+                if self.import.finished {
+                    self.import.failures = params["folders"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|f| f["status"].as_str() == Some("FAILED"))
+                        .map(|f| {
+                            format!(
+                                "{}: {}",
+                                f["folderUri"].as_str().unwrap_or("?"),
+                                f["message"].as_str().unwrap_or("import failed")
+                            )
+                        })
+                        .collect();
+                }
+                if self.verbose {
+                    eprintln!("[DAEMON] <<< {method} {params}");
+                }
+            }
+            "$/progress" => {
+                let token = &msg["params"]["token"];
+                let kind = msg["params"]["value"]["kind"].as_str().unwrap_or("");
+                match kind {
+                    "begin" => {
+                        self.pending_progress.insert(token.clone());
+                    }
+                    "end" => {
+                        self.pending_progress.remove(token);
+                    }
+                    _ => {}
+                }
+                if self.verbose {
+                    let v = &msg["params"]["value"];
+                    let text = v["title"].as_str().or_else(|| v["message"].as_str()).unwrap_or("");
+                    let pct = v["percentage"].as_u64().map(|p| format!(" {p}%")).unwrap_or_default();
+                    eprintln!(
+                        "[DAEMON] $/progress {kind}{pct} {text} (pending: {})",
+                        self.pending_progress.len()
+                    );
+                }
+            }
+            _ => {
+                if self.verbose {
+                    let params = msg["params"].to_string();
+                    let cut = params.char_indices().nth(400).map_or(params.len(), |(i, _)| i);
+                    eprintln!("[DAEMON] <<< {method} {}", &params[..cut]);
+                }
+            }
+        }
+        if let Some(id) = msg.get("id") {
+            let ack = json!({"jsonrpc":"2.0","id":id,"result":server_request_result(method, &msg["params"])});
+            let _ = self.send_raw(&ack);
+        }
+        true
+    }
 
+    /// Drain server messages until the server is idle, or `max_wait` elapses.
+    ///
+    /// `strict == false` ("settle"): return once the server has been quiet for
+    /// 500 ms with no open progress tokens, or quiet for 2 s even with open
+    /// tokens.  Used after didOpen/didChange so queries are not held up for the
+    /// whole of a long background import.
+    ///
+    /// `strict == true`: return only once every progress token has ended and
+    /// the server has been quiet for 500 ms.  Used by `lsp-client/waitIdle`.
+    ///
+    /// Returns `true` if idle was reached, `false` on timeout.
+    fn wait_for_idle(&mut self, max_wait: Duration, strict: bool) -> bool {
+        let deadline = Instant::now() + max_wait;
+        let mut last_activity = Instant::now();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                break;
+                return false;
             }
-            let timeout = remaining.min(Duration::from_millis(500));
-            match self.server_rx.recv_timeout(timeout) {
+            match self.server_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
                 Ok(msg) => {
                     last_activity = Instant::now();
-                    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                    match method {
-                        "window/workDoneProgress/create" => {
-                            if let Some(token) = msg["params"].get("token") {
-                                pending.insert(token.clone());
-                            }
-                            if let Some(id) = msg.get("id") {
-                                let ack = json!({"jsonrpc":"2.0","id":id,"result":null});
-                                let _ = self.send_raw(&ack);
-                            }
-                            if self.verbose {
-                                eprintln!(
-                                    "[DAEMON] progress token registered (pending: {})",
-                                    pending.len()
-                                );
-                            }
-                        }
-                        "$/progress" => {
-                            let token = &msg["params"]["token"];
-                            match msg["params"]["value"]["kind"].as_str().unwrap_or("") {
-                                "begin" => {
-                                    pending.insert(token.clone());
-                                }
-                                "end" => {
-                                    pending.remove(token);
-                                }
-                                _ => {}
-                            }
-                            if self.verbose {
-                                eprintln!(
-                                    "[DAEMON] $/progress {} (pending: {})",
-                                    msg["params"]["value"]["kind"]
-                                        .as_str()
-                                        .unwrap_or("?"),
-                                    pending.len()
-                                );
-                            }
-                        }
-                        _ => {
-                            if self.verbose && !method.is_empty() {
-                                eprintln!("[DAEMON] notification: {method}");
-                            }
-                        }
-                    }
+                    self.observe(&msg);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // Break if server is quiet with no outstanding tokens, OR if tokens
-                    // exist but the server has gone silent (server forgot to send "end").
-                    if pending.is_empty() || last_activity.elapsed() >= Duration::from_secs(2) {
-                        break;
+                    let quiet = last_activity.elapsed();
+                    let import_done = !self.import.expected || self.import.finished;
+                    let idle = self.pending_progress.is_empty()
+                        && import_done
+                        && quiet >= Duration::from_millis(500);
+                    let gave_up = !strict && quiet >= Duration::from_secs(2);
+                    if idle || gave_up {
+                        return idle;
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
+    }
+}
+
+/// Result to send for a server-initiated request.  `workspace/configuration`
+/// must be answered with one entry per requested item; everything else we
+/// receive (`window/workDoneProgress/create`, `client/registerCapability`, ...)
+/// takes `null`.
+fn server_request_result(method: &str, params: &Value) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let n = params["items"].as_array().map_or(0, |a| a.len());
+            Value::Array(vec![Value::Null; n])
+        }
+        _ => Value::Null,
     }
 }
 
@@ -247,8 +317,16 @@ fn handle_connection(
             Some("lsp-client/waitIdle") => {
                 // Block until the server finishes all in-progress work, then
                 // respond so the caller knows it's safe to query.
-                core.wait_for_idle();
-                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":"idle"});
+                let max_wait = msg["params"]["timeoutMs"]
+                    .as_u64()
+                    .map(Duration::from_millis)
+                    .unwrap_or(Duration::from_secs(300));
+                let idle = core.wait_for_idle(max_wait, true);
+                let result = json!({
+                    "status": if idle { "idle" } else { "timeout" },
+                    "importFailures": core.import.failures,
+                });
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
                 let _ = send_framed(&mut writer, &resp);
             }
 
@@ -306,7 +384,7 @@ fn handle_connection(
                 // by this notification (e.g., indexing after didOpen/didChange).
                 // The client is already waiting for its next response, so this
                 // delay is invisible to it.
-                core.wait_for_idle();
+                core.wait_for_idle(Duration::from_secs(60), false);
             }
 
             // ------------------------------------------------------------------
@@ -326,17 +404,9 @@ fn handle_connection(
                         Err(_) => return true, // server reader thread died
                     };
 
-                    if server_msg.get("method").is_some() {
-                        // Server-initiated request: ack internally, never forward.
-                        if server_msg.get("id").is_some() {
-                            let ack = json!({
-                                "jsonrpc": "2.0",
-                                "id": server_msg["id"],
-                                "result": null,
-                            });
-                            let _ = core.send_raw(&ack);
-                        }
-                        // Notifications from server while waiting: discard.
+                    // Server-initiated messages are acked/tracked internally,
+                    // never forwarded to the CLI client.
+                    if core.observe(&server_msg) {
                         continue;
                     }
 
@@ -401,6 +471,8 @@ pub fn run_daemon(
         next_id: 1,
         verbose,
         opened_versions: HashMap::new(),
+        pending_progress: HashSet::new(),
+        import: ImportState::default(),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -463,7 +535,7 @@ pub fn run_daemon(
     )?;
 
     core.notify("initialized", json!({}))?;
-    core.wait_for_idle();
+    core.wait_for_idle(Duration::from_secs(60), false);
 
     let init_result = init_resp
         .get("result")

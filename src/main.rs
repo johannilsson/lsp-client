@@ -7,7 +7,7 @@ mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::{IdleResult, LspSession};
+use session::{IdleResult, LspSession, WaitOutcome};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
@@ -298,16 +298,31 @@ fn main() {
                             .language_id
                             .as_deref()
                             .unwrap_or(&info.language_id);
-                        if let Err(e) = wait_for_daemon_ready(
+                        // The daemon keeps running either way; the exit code
+                        // matches `session wait-ready` (2 = timed out,
+                        // 3 = project import failed).
+                        match wait_for_daemon_ready(
                             &info.socket,
                             wait_file.as_deref(),
                             lang,
                             cli.verbose,
                             effective.timeout,
                         ) {
-                            eprintln!("Warning: wait-for-idle failed: {e}");
-                        } else {
-                            eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            Err(e) => {
+                                eprintln!("Warning: wait-for-idle failed: {e}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.idle => {
+                                eprintln!("Warning: server still busy (indexing not finished) for {root}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.import_failures.is_empty() => {
+                                outcome.warn_import_failures();
+                                std::process::exit(3);
+                            }
+                            Ok(_) => {
+                                eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            }
                         }
                     }
                 return;
@@ -514,9 +529,15 @@ fn main() {
             &cli.command
         {
             if use_daemon {
-                // Set a generous read timeout so we can wait a long time.
-                session.transport.set_read_timeout(Some(*wait_timeout));
-                session.wait_idle_request()?;
+                let outcome = session.wait_idle_request(*wait_timeout)?;
+                if !outcome.idle {
+                    eprintln!("Timed out waiting for server to become idle.");
+                    std::process::exit(2);
+                }
+                if !outcome.import_failures.is_empty() {
+                    outcome.warn_import_failures();
+                    std::process::exit(3);
+                }
             } else {
                 session.wait_for_index(*wait_timeout);
                 if matches!(session.last_idle_result, Some(IdleResult::TimedOut)) {
@@ -571,8 +592,11 @@ fn main() {
             if cli.wait_for_index && use_daemon {
                 let wait_dur =
                     effective.timeout.unwrap_or(std::time::Duration::from_secs(300));
-                session.transport.set_read_timeout(Some(wait_dur));
-                session.wait_idle_request()?;
+                let outcome = session.wait_idle_request(wait_dur)?;
+                if !outcome.idle && cli.verbose {
+                    eprintln!("[DEBUG] server still busy after {wait_dur:?}; querying anyway");
+                }
+                outcome.warn_import_failures();
                 // Restore the configured timeout for subsequent queries.
                 session.transport.set_read_timeout(effective.timeout);
             }
@@ -800,8 +824,10 @@ fn connect_or_start_daemon(
 }
 
 /// Spawn `lsp-client session daemon-run` as a background process and block
-/// until the session file appears (daemon has finished initialising), or 30 s
-/// elapse.
+/// until the session file appears (daemon has finished initialising), or the
+/// configured `--timeout` (at least 30 s) elapses.  JVM-based servers such as
+/// kotlin-lsp can take longer than 30 s just to answer `initialize` on a large
+/// Gradle/Android workspace.
 fn start_daemon(
     effective: &EffectiveConfig,
     verbose: bool,
@@ -845,14 +871,18 @@ fn start_daemon(
     // Poll for the session file to appear — this means the daemon has
     // successfully initialised the LSP server and is ready to accept clients.
     let root = &effective.root;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let max_wait = effective
+        .timeout
+        .unwrap_or_default()
+        .max(std::time::Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + max_wait;
     loop {
         if SessionInfo::load(root).map(|i| i.initialized).unwrap_or(false) {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "daemon did not become ready within 30 s (check '{} --verbose session start')",
+                "daemon did not become ready within {max_wait:?} (raise --timeout, or check '{} --verbose session start')",
                 exe.display()
             )
             .into());
@@ -870,19 +900,17 @@ fn wait_for_daemon_ready(
     language_id: &str,
     verbose: bool,
     timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
+    let max_wait = timeout.unwrap_or(std::time::Duration::from_secs(300));
     let transport = Transport::unix_socket(socket)?;
-    if let Some(dur) = timeout.or(Some(std::time::Duration::from_secs(300))) {
-        transport.set_read_timeout(Some(dur));
-    }
+    transport.set_read_timeout(Some(max_wait));
     let mut session = LspSession::new(transport, verbose, timeout);
     // No initialize needed — daemon has the cached result.
     if let Some(f) = wait_file {
         let abs = abs_path(f);
         session.did_open(&abs, language_id)?;
     }
-    session.wait_idle_request()?;
-    Ok(())
+    session.wait_idle_request(max_wait)
 }
 
 #[cfg(not(unix))]
@@ -892,7 +920,7 @@ fn wait_for_daemon_ready(
     _language_id: &str,
     _verbose: bool,
     _timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
     Err("Unix sockets not available on this platform".into())
 }
 
