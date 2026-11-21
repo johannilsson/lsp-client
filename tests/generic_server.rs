@@ -68,6 +68,8 @@ fn server_that_never_ends_a_progress_token_is_still_ready() {
     let hover = ws.run(&["query", "hover", file.to_str().unwrap(), "1", "1"]);
     assert!(String::from_utf8_lossy(&hover.stdout).contains("hover from the fake server"));
     assert!(!String::from_utf8_lossy(&hover.stderr).contains("Warning"), "stderr: {}", String::from_utf8_lossy(&hover.stderr));
+    let status = ws.run(&["session", "status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("import:      n/a"));
 }
 
 #[test]
