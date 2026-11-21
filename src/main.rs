@@ -679,7 +679,15 @@ fn main() {
                     if cli.json {
                         print_json(&resp)
                     } else {
-                        println!("{}", format_semantic_tokens(&resp))
+                        // The token legend is in the server's capabilities.  In daemon
+                        // mode `initialize` was skipped above, so ask the daemon for
+                        // the cached answer.
+                        let caps = if init_resp.is_null() {
+                            session.initialize(root)?["result"]["capabilities"].clone()
+                        } else {
+                            init_resp["result"]["capabilities"].clone()
+                        };
+                        println!("{}", format_semantic_tokens(&resp, &caps))
                     }
                 }
                 QueryCommand::InlayHints { file, start_line, end_line } => {
