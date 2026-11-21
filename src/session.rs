@@ -117,6 +117,9 @@ impl LspSession {
                     "hover": {"contentFormat": ["plaintext", "markdown"]},
                     "completion": {"completionItem": {"snippetSupport": false}},
                     "definition": {},
+                    "implementation": {},
+                    "typeDefinition": {},
+                    "callHierarchy": {},
                     "references": {},
                     "documentSymbol": {},
                     "diagnostic": {},
@@ -332,6 +335,46 @@ impl LspSession {
         }))
     }
 
+    pub fn implementation(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
+        self.request("textDocument/implementation", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "position": {"line": line, "character": col},
+        }))
+    }
+
+    pub fn type_definition(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
+        self.request("textDocument/typeDefinition", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "position": {"line": line, "character": col},
+        }))
+    }
+
+    /// Call hierarchy in one step: `prepareCallHierarchy` at the position,
+    /// then incoming or outgoing calls for each item it returns.  The result
+    /// is `{"result": [{"item": <CallHierarchyItem>, "calls": [...]}, ...]}`.
+    pub fn calls(&mut self, file_path: &str, line: u32, col: u32, dir: CallDirection) -> Result<Value> {
+        let prepared = self.request("textDocument/prepareCallHierarchy", json!({
+            "textDocument": {"uri": file_uri(file_path)},
+            "position": {"line": line, "character": col},
+        }))?;
+        if let Some(err) = prepared.get("error").filter(|e| !e.is_null()) {
+            return Ok(json!({"error": err}));
+        }
+        let method = match dir {
+            CallDirection::Incoming => "callHierarchy/incomingCalls",
+            CallDirection::Outgoing => "callHierarchy/outgoingCalls",
+        };
+        let mut out = Vec::new();
+        for item in prepared["result"].as_array().cloned().unwrap_or_default() {
+            let resp = self.request(method, json!({"item": item}))?;
+            if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
+                return Ok(json!({"error": err}));
+            }
+            out.push(json!({"item": item, "calls": resp["result"]}));
+        }
+        Ok(json!({"result": out}))
+    }
+
     pub fn references(&mut self, file_path: &str, line: u32, col: u32) -> Result<Value> {
         self.request("textDocument/references", json!({
             "textDocument": {"uri": file_uri(file_path)},
@@ -408,4 +451,10 @@ impl LspSession {
         let _ = self.request("shutdown", json!({}));
         let _ = self.notify("exit", json!({}));
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum CallDirection {
+    Incoming,
+    Outgoing,
 }
