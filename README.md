@@ -24,6 +24,10 @@ Commands:
 ```
 lsp-client query hover             <file> <line> <col>
 lsp-client query definition        <file> <line> <col>
+lsp-client query implementation    <file> <line> <col>
+lsp-client query type-definition   <file> <line> <col>
+lsp-client query incoming-calls    <file> <line> <col>
+lsp-client query outgoing-calls    <file> <line> <col>
 lsp-client query references        <file> <line> <col>
 lsp-client query symbols           <file>
 lsp-client query workspace-symbols <query>

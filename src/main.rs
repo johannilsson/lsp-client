@@ -7,7 +7,7 @@ mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::{IdleResult, LspSession, WaitOutcome};
+use session::{CallDirection, IdleResult, LspSession, WaitOutcome};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
@@ -107,6 +107,30 @@ enum QueryCommand {
     },
     /// Jump to definition
     Definition {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// Find implementations of an interface, abstract member or open class
+    Implementation {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// Jump to the declaration of the symbol's type
+    TypeDefinition {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// List the callers of the function at a position
+    IncomingCalls {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// List the functions called by the function at a position
+    OutgoingCalls {
         file: String,
         line: u32,
         col: u32,
@@ -560,6 +584,10 @@ fn main() {
                 Command::Query { command } => match command {
                     QueryCommand::Hover { file, .. }
                     | QueryCommand::Definition { file, .. }
+                    | QueryCommand::Implementation { file, .. }
+                    | QueryCommand::TypeDefinition { file, .. }
+                    | QueryCommand::IncomingCalls { file, .. }
+                    | QueryCommand::OutgoingCalls { file, .. }
                     | QueryCommand::References { file, .. }
                     | QueryCommand::Symbols { file }
                     | QueryCommand::Diagnostics { file }
@@ -613,6 +641,26 @@ fn main() {
                     let abs = abs_path(file);
                     let resp = session.definition(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_definition(&resp)) }
+                }
+                QueryCommand::Implementation { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.implementation(&abs, line - 1, col - 1)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_locations(&resp, "No implementations found.")) }
+                }
+                QueryCommand::TypeDefinition { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.type_definition(&abs, line - 1, col - 1)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_locations(&resp, "No type definition found.")) }
+                }
+                QueryCommand::IncomingCalls { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.calls(&abs, line - 1, col - 1, CallDirection::Incoming)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_calls(&resp, CallDirection::Incoming)) }
+                }
+                QueryCommand::OutgoingCalls { file, line, col } => {
+                    let abs = abs_path(file);
+                    let resp = session.calls(&abs, line - 1, col - 1, CallDirection::Outgoing)?;
+                    if cli.json { print_json(&resp) } else { println!("{}", format_calls(&resp, CallDirection::Outgoing)) }
                 }
                 QueryCommand::References { file, line, col } => {
                     let abs = abs_path(file);
