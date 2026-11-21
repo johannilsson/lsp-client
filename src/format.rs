@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 
 fn uri_to_path(uri: &str) -> &str {
@@ -62,6 +62,16 @@ pub fn format_capabilities(caps: &Value) -> String {
     }
     if bool_cap("definitionProvider") {
         lines.push("definition             : yes".into());
+    }
+    for (key, label) in [
+        ("implementationProvider", "implementation         : yes"),
+        ("typeDefinitionProvider", "typeDefinition         : yes"),
+        ("callHierarchyProvider", "callHierarchy          : yes"),
+        ("typeHierarchyProvider", "typeHierarchy          : yes"),
+    ] {
+        if bool_cap(key) {
+            lines.push(label.into());
+        }
     }
     if bool_cap("referencesProvider") {
         lines.push("references             : yes".into());
@@ -162,6 +172,70 @@ fn dedup_locations(locs: &[Value]) -> Vec<&Value> {
             seen.insert(key)
         })
         .collect()
+}
+
+/// Format a `Location | Location[] | LocationLink[]` result.
+pub fn format_locations(resp: &Value, empty: &str) -> String {
+    let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
+        return empty.into();
+    };
+    let items: Vec<Value> = match result.as_array() {
+        Some(a) => a.clone(),
+        None => vec![result.clone()],
+    };
+    // LocationLink → Location (targetUri + targetSelectionRange).
+    let locs: Vec<Value> = items
+        .into_iter()
+        .map(|l| match l.get("targetUri") {
+            Some(uri) => json!({"uri": uri, "range": l["targetSelectionRange"]}),
+            None => l,
+        })
+        .collect();
+    let unique = dedup_locations(&locs);
+    if unique.is_empty() {
+        return empty.into();
+    }
+    unique.into_iter().map(format_location).collect::<Vec<_>>().join("\n")
+}
+
+fn format_call_item(item: &Value) -> String {
+    let kind = symbol_kind(item["kind"].as_u64().unwrap_or(0));
+    let name = item["name"].as_str().unwrap_or("?");
+    let detail = item["detail"].as_str().filter(|d| !d.is_empty()).map(|d| format!(" — {d}")).unwrap_or_default();
+    let loc = format_location(&json!({"uri": item["uri"], "range": item["selectionRange"]}));
+    format!("{kind} {name}{detail}  →  {loc}")
+}
+
+/// Format the result of `LspSession::calls`.
+pub fn format_calls(resp: &Value, dir: crate::session::CallDirection) -> String {
+    use crate::session::CallDirection;
+    if let Some(msg) = resp["error"]["message"].as_str() {
+        return format!("Error: {msg}");
+    }
+    let Some(roots) = resp["result"].as_array().filter(|a| !a.is_empty()) else {
+        return "No function at this position.".into();
+    };
+    let mut lines = Vec::new();
+    for root in roots {
+        lines.push(format_call_item(&root["item"]));
+        let calls = root["calls"].as_array().cloned().unwrap_or_default();
+        if calls.is_empty() {
+            lines.push(match dir {
+                CallDirection::Incoming => "  (no callers found)".into(),
+                CallDirection::Outgoing => "  (no calls found)".into(),
+            });
+        }
+        for call in calls {
+            let (arrow, other) = match dir {
+                CallDirection::Incoming => ("←", &call["from"]),
+                CallDirection::Outgoing => ("→", &call["to"]),
+            };
+            let n = call["fromRanges"].as_array().map_or(0, |a| a.len());
+            let times = if n > 1 { format!(" ({n} call sites)") } else { String::new() };
+            lines.push(format!("  {arrow} {}{times}", format_call_item(other)));
+        }
+    }
+    lines.join("\n")
 }
 
 pub fn format_references(resp: &Value) -> String {

@@ -160,3 +160,13 @@ fn test_json_flag() {
     assert_eq!(json["ok"], serde_json::json!(true), "expected ok=true: {s}");
     assert!(json["result"].is_array(), "expected result array: {s}");
 }
+
+#[test]
+fn test_outgoing_calls() {
+    // `distance` (line 15, col 12) calls f64::sqrt.
+    let out = run(&["query", "outgoing-calls", &fixture_file("lib.rs"), "15", "12"]);
+    assert_ok(&out);
+    let s = stdout(&out);
+    assert!(s.contains("distance"), "expected the prepared item 'distance': {s}");
+    assert!(s.contains("→ ") && s.contains("sqrt"), "expected a call to sqrt: {s}");
+}
