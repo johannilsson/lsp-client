@@ -32,6 +32,13 @@ fn file_uri(path: &str) -> String {
     format!("file://{}", p.display())
 }
 
+/// Direction of a call hierarchy query.
+#[derive(Clone, Copy, PartialEq)]
+pub enum CallDirection {
+    Incoming,
+    Outgoing,
+}
+
 impl LspSession {
     pub fn new(transport: Transport, verbose: bool, timeout: Option<Duration>) -> Self {
         Self {
@@ -451,10 +458,4 @@ impl LspSession {
         let _ = self.request("shutdown", json!({}));
         let _ = self.notify("exit", json!({}));
     }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum CallDirection {
-    Incoming,
-    Outgoing,
 }

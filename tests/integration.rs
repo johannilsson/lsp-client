@@ -134,6 +134,16 @@ fn test_definition() {
 }
 
 #[test]
+fn test_outgoing_calls() {
+    // `distance` (line 15, col 12) calls f64::sqrt.
+    let out = run(&["query", "outgoing-calls", &fixture_file("lib.rs"), "15", "12"]);
+    assert_ok(&out);
+    let s = stdout(&out);
+    assert!(s.contains("distance"), "expected the prepared item 'distance': {s}");
+    assert!(s.contains("→ ") && s.contains("sqrt"), "expected a call to sqrt: {s}");
+}
+
+#[test]
 fn test_diagnostics_clean() {
     let out = run(&["query", "diagnostics", &fixture_file("lib.rs")]);
     assert_ok(&out);
@@ -159,14 +169,4 @@ fn test_json_flag() {
         serde_json::from_str(&s).unwrap_or_else(|e| panic!("invalid JSON: {e}\noutput: {s}"));
     assert_eq!(json["ok"], serde_json::json!(true), "expected ok=true: {s}");
     assert!(json["result"].is_array(), "expected result array: {s}");
-}
-
-#[test]
-fn test_outgoing_calls() {
-    // `distance` (line 15, col 12) calls f64::sqrt.
-    let out = run(&["query", "outgoing-calls", &fixture_file("lib.rs"), "15", "12"]);
-    assert_ok(&out);
-    let s = stdout(&out);
-    assert!(s.contains("distance"), "expected the prepared item 'distance': {s}");
-    assert!(s.contains("→ ") && s.contains("sqrt"), "expected a call to sqrt: {s}");
 }
