@@ -147,3 +147,29 @@ fn initialization_options_reach_the_server() {
     let entries = std::fs::read_dir(&index).map(|d| d.count()).unwrap_or(0);
     assert!(entries > 0, "expected the server to use {}", index.display());
 }
+
+#[test]
+fn failed_import_names_the_server_log_and_session_log_shows_it() {
+    if !kotlin_lsp_available() {
+        eprintln!("skipped: kotlin-lsp not on PATH");
+        return;
+    }
+    // A build script that does not compile: the import fails.
+    let broken = format!("{GRADLE}this is not valid kotlin\n");
+    let p = Project::new("brokenscript", &[("build.gradle.kts", &broken)]);
+    let out = p.start(&[]);
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    let log = err
+        .split("server log: ")
+        .nth(1)
+        .map(|rest| rest.lines().next().unwrap_or("").trim().to_string())
+        .unwrap_or_default();
+    assert!(log.starts_with('/') && std::path::Path::new(&log).exists(), "no usable log path in: {err}");
+    // `session status` shows the same file, and `session log` prints the end of it.
+    let status = p.run(&["session", "status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains(&format!("server log:  {log}")));
+    let tail = p.run(&["session", "log", "-n", "5"]);
+    assert_eq!(tail.status.code(), Some(0), "stderr: {}", stderr(&tail));
+    assert!(!tail.stdout.is_empty());
+}
