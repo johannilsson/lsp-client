@@ -111,3 +111,24 @@ fn build_tool_option_resolves_the_ambiguity() {
     let symbols = p.run(&["query", "symbols", main.to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&symbols.stdout).contains("main"), "stderr: {}", stderr(&symbols));
 }
+
+#[test]
+fn initialization_options_reach_the_server() {
+    if !kotlin_lsp_available() {
+        eprintln!("skipped: kotlin-lsp not on PATH");
+        return;
+    }
+    let p = Project::new("initopts", &[("build.gradle.kts", GRADLE)]);
+    let index = p.path().join("my-index");
+    // TOML literal string, so no escaping of the path is needed.
+    let cfg = format!(
+        "server = \"kotlin-lsp\"\nlanguage_id = \"kotlin\"\n\n[initialization_options]\nindexDir = '{}'\n",
+        index.display()
+    );
+    std::fs::write(p.path().join(".lsp-client.toml"), cfg).unwrap();
+    let out = p.run(&["session", "start", "--wait"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    // kotlin-lsp creates the directory it was told to use.
+    let entries = std::fs::read_dir(&index).map(|d| d.count()).unwrap_or(0);
+    assert!(entries > 0, "expected the server to use {}", index.display());
+}

@@ -488,6 +488,15 @@ fn handle_connection(
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Settings that only matter to the daemon process.
+#[derive(Default)]
+pub struct DaemonOptions {
+    /// Answer for the server's "which build tool?" question (`--build-tool`).
+    pub build_tool: Option<String>,
+    /// `initializationOptions` for `initialize` (`[initialization_options]` in the config file).
+    pub initialization_options: Option<Value>,
+}
+
 /// Run the daemon process.  This function blocks until the daemon shuts down
 /// (idle timeout, server crash, or explicit stop request).
 pub fn run_daemon(
@@ -497,7 +506,7 @@ pub fn run_daemon(
     idle_secs: u64,
     verbose: bool,
     language_id: &str,
-    build_tool: Option<&str>,
+    options: DaemonOptions,
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
@@ -538,7 +547,7 @@ pub fn run_daemon(
         opened_versions: HashMap::new(),
         pending_progress: HashSet::new(),
         import: ImportState::default(),
-        build_tool: build_tool.map(str::to_owned),
+        build_tool: options.build_tool.clone(),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -556,9 +565,7 @@ pub fn run_daemon(
         eprintln!("[DAEMON] initialising {server_bin} for {canonical_root}");
     }
 
-    let init_resp = core.request(
-        "initialize",
-        json!({
+    let mut init_params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -597,8 +604,11 @@ pub fn run_daemon(
                 "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
-        }),
-    )?;
+    });
+    if let Some(opts) = &options.initialization_options {
+        init_params["initializationOptions"] = opts.clone();
+    }
+    let init_resp = core.request("initialize", init_params)?;
 
     core.notify("initialized", json!({}))?;
     core.wait_for_idle(Duration::from_secs(60), false);
