@@ -49,9 +49,14 @@ lsp-client session stop       Stop the daemon
 lsp-client session wait-ready Wait until the server has finished indexing
 ```
 
-`session wait-ready` and `session start --wait` exit with 2 if the server is still busy when the timeout runs out, and with 3 if the server reported a failed project import (kotlin-lsp's Gradle/Maven sync). After a failed import, queries return little or nothing. The daemon keeps running in both cases.
+`session wait-ready` and `session start --wait` exit with 2 if the server is still busy when the timeout runs out, and with 3 if the project was not imported. The daemon keeps running in both cases.
 
-kotlin-lsp keeps the imported project model between runs and only imports again when the build files change. After a restart it reuses even a failed import, without reporting it again: fix the build, then edit or touch a build file, or open the project from a fresh path.
+kotlin-lsp reports a project that was not imported in two ways, and both give exit code 3 and a warning that says what happened:
+
+- **The import failed**, for example `project import failed for /my/project/: Gradle sync failed`. Queries then return little or nothing. The server log has the details (`--verbose` prints its path).
+- **The import was blocked**, because kotlin-lsp could not decide what to import: `no supported build system found in the project root`, or `more than one build tool found (gradle, maven)`. For the second case, choose one with `--build-tool gradle` (or `build_tool = "gradle"` in `.lsp-client.toml`). kotlin-lsp asks "Which build tool would you like to use?"; `--build-tool` answers by picking the button whose title contains that name, and the server remembers the answer for the workspace. Without it the question is dismissed. Only file-level queries (`symbols`, ...) work until the project is imported.
+
+kotlin-lsp keeps the imported project model between runs and only imports again when the build files change. After a restart it reuses even a failed or blocked result, without reporting it again: fix the build, then edit or touch a build file, or open the project from a fresh path.
 
 Line and column numbers are 1-based.
 
@@ -85,6 +90,7 @@ lsp-client session stop
 | `--host` | `127.0.0.1` | Server host (TCP mode) |
 | `--port` | `9999` | Server port (TCP mode) |
 | `--no-server-stdio-flag` | — | Don't pass `--stdio` to the server process |
+| `--build-tool` | — | Build tool to use when a project has more than one, e.g. `gradle` or `maven` (kotlin-lsp) |
 | `--json` | — | Emit `{"ok": true, "result": ...}` JSON |
 | `--verbose` / `-v` | — | Debug logging to stderr |
 
@@ -98,6 +104,7 @@ language_id = "kotlin"
 root        = "/path/to/your/project"   # defaults to cwd if omitted
 timeout     = "30s"
 no_server_stdio_flag = false
+build_tool  = "gradle"                  # only needed when a project has both Gradle and Maven files
 ```
 
 All fields are optional. `lsp-client` walks up from the current directory to find the nearest `.lsp-client.toml`, so placing it at the repo root covers all subdirectories.
@@ -164,6 +171,12 @@ cargo test --test integration -- --test-threads=1
 ```
 
 The first run starts a daemon for the fixture project and warms it up; subsequent runs reuse it. The daemon shuts itself down after 5 minutes of inactivity.
+
+`tests/kotlin_lsp.rs` tests kotlin-lsp's project import handling (a folder without a build file, a folder with both Gradle and Maven files, and `--build-tool`) on tiny projects it creates in a temp directory. It needs `kotlin-lsp` on `PATH` and network access for Gradle, and is skipped with a note when kotlin-lsp is missing:
+
+```sh
+cargo test --test kotlin_lsp -- --nocapture --test-threads=1
+```
 
 ## How it works
 
