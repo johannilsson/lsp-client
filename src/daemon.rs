@@ -18,6 +18,7 @@
 //! time.  This is correct for LSP (which is already sequential in practice)
 //! and avoids needing an async runtime.
 
+use crate::servers::{self, ServerFacts, ServerProfile};
 use crate::session_file::{unix_timestamp, SessionInfo};
 use crate::transport::MessageReader;
 use serde_json::{json, Value};
@@ -60,79 +61,28 @@ struct DaemonCore {
     /// Kept across calls: servers such as kotlin-lsp run a Gradle import that
     /// can stay silent for minutes while its token is still open.
     pending_progress: HashSet<Value>,
-    /// IntelliJ-based servers (kotlin-lsp) announce a project import with
-    /// `intellij/workspaceImportStatus` and report its outcome with
-    /// `intellij/workspaceImportState`.  The import can start several seconds
-    /// after `initialized`, and may report no `$/progress` at all, so once a
-    /// server has announced one, idle also requires the import to be finished.
-    import: ImportState,
-    /// Answer for the server's "which build tool?" question (`--build-tool`).
+    /// Server-specific behaviour (see `servers`). Generic until the server has
+    /// answered `initialize` and told us what it is.
+    profile: Box<dyn ServerProfile>,
+    /// What the profile has learned about the server, e.g. that it is importing a
+    /// project. Stays empty for servers whose profile knows nothing to record.
+    facts: ServerFacts,
+    /// Notifications that arrived before the profile was chosen, to hand to it once
+    /// it is. `None` once that has happened.
+    early: Option<Vec<Value>>,
+    /// Answer for the server's "which build tool?" question (`--build-tool`), for the
+    /// profiles whose server asks one.
     build_tool: Option<String>,
 }
 
-#[derive(Default)]
-struct ImportState {
-    /// Folders the server could not import and why, from the latest
-    /// `intellij/workspaceImportStatus` (`blockedFolders`).
-    blocked: Vec<Value>,
-    /// The server announced a project import.
-    expected: bool,
-    /// The server reported the import as finished (successfully or not).
-    finished: bool,
-    /// One message per folder that was not imported (failed or blocked), from
-    /// the last finished import.
-    failures: Vec<String>,
-}
-
-/// Human-readable explanation of why a folder was not imported.  `status` and
-/// `message` come from `intellij/workspaceImportState` (`FAILED` or
-/// `BLOCKED`); for blocked folders `message` is the reason id and
-/// `candidates` are the build tools the server found.
-fn describe_import_problem(status: &str, folder: &str, message: &str, candidates: &[String]) -> String {
-    let path = folder.strip_prefix("file://").unwrap_or(folder);
-    if status != "BLOCKED" {
-        return format!(
-            "project import failed for {path}: {message}. Results will be incomplete; see the server log (--verbose prints its path)."
-        );
-    }
-    let why = match message {
-        "ambiguousBuildSystem" => format!(
-            "more than one build tool found ({}); choose one with --build-tool or `build_tool` in .lsp-client.toml",
-            candidates.join(", ")
-        ),
-        "noBuildSystemFound" => "no supported build system found in the project root".to_string(),
-        "noProjectInRoot" => "no project found in the root folder".to_string(),
-        "noProjectAtConfiguredPath" => "no project at the configured path".to_string(),
-        "cannotResolveConfiguredPath" | "cannotResolveFolderPath" => "the folder path could not be resolved".to_string(),
-        "unknownBuildTool" => "unknown build tool".to_string(),
-        other => other.to_string(),
-    };
-    format!("project not imported for {path}: {why}. Results will be limited to file-level queries.")
-}
-
-/// Answer to a server-initiated request.  `workspace/configuration` needs one
-/// entry per requested item.  `window/showMessageRequest` is a question with
-/// buttons: answer with the action whose title contains `build_tool`
-/// (kotlin-lsp's "Use Gradle" / "Use Maven"), or dismiss it.  Everything else
-/// (`window/workDoneProgress/create`, `client/registerCapability`, ...) takes
-/// `null`.
-fn server_request_result(method: &str, params: &Value, build_tool: Option<&str>) -> Value {
+/// Answer to a server-initiated request that no profile answered.
+/// `workspace/configuration` needs one entry per requested item; everything else
+/// (`window/workDoneProgress/create`, `client/registerCapability`, ...) takes `null`.
+fn server_request_result(method: &str, params: &Value) -> Value {
     match method {
         "workspace/configuration" => {
             let n = params["items"].as_array().map_or(0, |a| a.len());
             Value::Array(vec![Value::Null; n])
-        }
-        "window/showMessageRequest" => {
-            let want = build_tool.map(str::to_lowercase).filter(|t| !t.is_empty());
-            let actions = params["actions"].as_array();
-            match (want, actions) {
-                (Some(want), Some(actions)) => actions
-                    .iter()
-                    .find(|a| a["title"].as_str().is_some_and(|t| t.to_lowercase().contains(&want)))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                _ => Value::Null,
-            }
         }
         _ => Value::Null,
     }
@@ -141,6 +91,15 @@ fn server_request_result(method: &str, params: &Value, build_tool: Option<&str>)
 impl DaemonCore {
     fn send_raw(&mut self, msg: &Value) -> io::Result<()> {
         send_framed(self.server_writer.as_mut(), msg)
+    }
+
+    /// Switch to `profile` (chosen after `initialize`), and let it see the
+    /// notifications the server sent before we knew which profile to use.
+    fn use_profile(&mut self, profile: Box<dyn ServerProfile>) {
+        self.profile = profile;
+        for msg in self.early.take().unwrap_or_default() {
+            self.profile.on_message(&msg, &mut self.facts);
+        }
     }
 
     /// Send a JSON-RPC request to the server and return its response.
@@ -180,55 +139,16 @@ impl DaemonCore {
         let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
             return false;
         };
+        if let Some(early) = &mut self.early
+            && msg.get("id").is_none()
+        {
+            early.push(msg.clone());
+        }
+        self.profile.on_message(msg, &mut self.facts);
         match method {
             // A created token only counts once it begins: kotlin-lsp creates
             // tokens and then cancels the create request without using them.
             "window/workDoneProgress/create" => {}
-            "intellij/workspaceImportStatus" => {
-                if !self.import.finished {
-                    self.import.expected = true;
-                }
-                if let Some(blocked) = msg["params"]["blockedFolders"].as_array() {
-                    self.import.blocked = blocked.clone();
-                }
-                if self.verbose {
-                    eprintln!("[DAEMON] <<< {method} {}", msg["params"]);
-                }
-            }
-            "intellij/workspaceImportState" => {
-                let params = &msg["params"];
-                self.import.expected = true;
-                self.import.finished = params["phase"].as_str() == Some("FINISHED");
-                if self.import.finished {
-                    let blocked = &self.import.blocked;
-                    self.import.failures = params["folders"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|f| matches!(f["status"].as_str(), Some("FAILED" | "BLOCKED")))
-                        .map(|f| {
-                            let folder = f["folderUri"].as_str().unwrap_or("?");
-                            let candidates: Vec<String> = blocked
-                                .iter()
-                                .find(|b| b["folderUri"].as_str() == Some(folder))
-                                .and_then(|b| b["candidates"].as_array())
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|c| c.as_str().map(str::to_owned))
-                                .collect();
-                            describe_import_problem(
-                                f["status"].as_str().unwrap_or("FAILED"),
-                                folder,
-                                f["message"].as_str().unwrap_or("import failed"),
-                                &candidates,
-                            )
-                        })
-                        .collect();
-                }
-                if self.verbose {
-                    eprintln!("[DAEMON] <<< {method} {params}");
-                }
-            }
             "$/progress" => {
                 let token = &msg["params"]["token"];
                 let kind = msg["params"]["value"]["kind"].as_str().unwrap_or("");
@@ -260,7 +180,10 @@ impl DaemonCore {
             }
         }
         if let Some(id) = msg.get("id") {
-            let result = server_request_result(method, &msg["params"], self.build_tool.as_deref());
+            let result = self
+                .profile
+                .answer_request(method, &msg["params"], self.build_tool.as_deref())
+                .unwrap_or_else(|| server_request_result(method, &msg["params"]));
             if self.verbose && method == "window/showMessageRequest" {
                 eprintln!("[DAEMON] answering {method} with {result}");
             }
@@ -298,7 +221,7 @@ impl DaemonCore {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     let quiet = last_activity.elapsed();
-                    let import_running = self.import.expected && !self.import.finished;
+                    let import_running = self.facts.import.expected && !self.facts.import.finished;
                     let idle = self.pending_progress.is_empty()
                         && !import_running
                         && quiet >= Duration::from_millis(500);
@@ -395,7 +318,7 @@ fn handle_connection(
                 let idle = core.wait_for_idle(max_wait, true);
                 let result = json!({
                     "status": if idle { "idle" } else { "timeout" },
-                    "importFailures": core.import.failures,
+                    "importFailures": core.facts.import.failures,
                 });
                 let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
                 let _ = send_framed(&mut writer, &resp);
@@ -502,6 +425,8 @@ pub struct DaemonOptions {
     pub build_tool: Option<String>,
     /// `initializationOptions` for `initialize` (`[initialization_options]` in the config file).
     pub initialization_options: Option<Value>,
+    /// Server profile asked for by name (`--server-profile`); `None` means auto.
+    pub profile: Option<String>,
 }
 
 /// Run the daemon process.  This function blocks until the daemon shuts down
@@ -553,7 +478,9 @@ pub fn run_daemon(
         verbose,
         opened_versions: HashMap::new(),
         pending_progress: HashSet::new(),
-        import: ImportState::default(),
+        profile: servers::generic(),
+        facts: ServerFacts::default(),
+        early: Some(Vec::new()),
         build_tool: options.build_tool.clone(),
     };
 
@@ -617,6 +544,13 @@ pub fn run_daemon(
     }
     let init_resp = core.request("initialize", init_params)?;
 
+    // Now the server has said what it is, choose its profile (see `servers`).
+    let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
+    core.use_profile(servers::select(options.profile.as_deref(), server_name)?);
+    if verbose {
+        eprintln!("[DAEMON] server profile: {}", core.profile.name());
+    }
+
     core.notify("initialized", json!({}))?;
     core.wait_for_idle(Duration::from_secs(60), false);
 
@@ -643,6 +577,7 @@ pub fn run_daemon(
         socket: socket_path.clone(),
         started_at: unix_timestamp(),
         initialized: true,
+        profile: core.profile.name().to_owned(),
     };
     info.save()?;
 
@@ -713,52 +648,64 @@ pub fn run_daemon(
 mod tests {
     use super::*;
 
-    fn buttons() -> Value {
-        json!({"actions": [{"title": "Use Gradle"}, {"title": "Use Maven"}, {"title": "Configure…"}]})
+    fn core_for_test() -> DaemonCore {
+        let (_tx, rx) = mpsc::channel();
+        DaemonCore {
+            server_writer: Box::new(io::sink()),
+            server_rx: rx,
+            next_id: 1,
+            verbose: false,
+            opened_versions: HashMap::new(),
+            pending_progress: HashSet::new(),
+            profile: servers::generic(),
+            facts: ServerFacts::default(),
+            early: Some(Vec::new()),
+            build_tool: None,
+        }
+    }
+
+    fn failed_import() -> Value {
+        json!({"jsonrpc": "2.0", "method": "intellij/workspaceImportState", "params": {
+            "phase": "FINISHED",
+            "folders": [{"folderUri": "file:///p/", "message": "Gradle sync failed", "status": "FAILED"}],
+        }})
     }
 
     #[test]
-    fn build_tool_answers_the_matching_button() {
-        let r = server_request_result("window/showMessageRequest", &buttons(), Some("maven"));
-        assert_eq!(r, json!({"title": "Use Maven"}));
-        // Case-insensitive.
-        let r = server_request_result("window/showMessageRequest", &buttons(), Some("Gradle"));
-        assert_eq!(r, json!({"title": "Use Gradle"}));
+    fn what_arrives_before_the_profile_is_known_is_replayed_to_it() {
+        let mut core = core_for_test();
+        // Sent while `initialize` is still being answered: nobody knows the server yet.
+        core.observe(&failed_import());
+        assert!(core.facts.import.failures.is_empty());
+        core.use_profile(servers::by_name("kotlin-lsp").unwrap());
+        assert_eq!(core.facts.import.failures.len(), 1);
+        assert!(core.early.is_none());
     }
 
     #[test]
-    fn question_without_a_matching_choice_is_dismissed() {
-        assert_eq!(server_request_result("window/showMessageRequest", &buttons(), None), Value::Null);
-        assert_eq!(server_request_result("window/showMessageRequest", &buttons(), Some("bazel")), Value::Null);
-        assert_eq!(server_request_result("window/showMessageRequest", &buttons(), Some("")), Value::Null);
+    fn nothing_reaches_the_facts_of_a_server_without_a_profile() {
+        let mut core = core_for_test();
+        core.observe(&failed_import());
+        core.use_profile(servers::generic());
+        core.observe(&failed_import());
+        assert!(!core.facts.import.expected && core.facts.import.failures.is_empty());
     }
 
     #[test]
-    fn other_requests_keep_their_answers() {
+    fn the_default_answers_to_server_requests() {
+        // `workspace/configuration` needs one entry per requested item.
         let cfg = json!({"items": [{}, {}]});
-        assert_eq!(server_request_result("workspace/configuration", &cfg, Some("gradle")), json!([null, null]));
-        assert_eq!(server_request_result("window/workDoneProgress/create", &json!({}), None), Value::Null);
+        assert_eq!(server_request_result("workspace/configuration", &cfg), json!([null, null]));
+        for method in ["window/workDoneProgress/create", "client/registerCapability", "window/showMessageRequest"] {
+            assert_eq!(server_request_result(method, &json!({})), Value::Null, "{method}");
+        }
     }
 
     #[test]
-    fn blocked_folders_are_explained() {
-        let amb = describe_import_problem(
-            "BLOCKED",
-            "file:///p/amb/",
-            "ambiguousBuildSystem",
-            &["gradle".to_string(), "maven".to_string()],
-        );
-        assert!(amb.contains("/p/amb/") && amb.contains("gradle, maven") && amb.contains("--build-tool"), "{amb}");
-        let none = describe_import_problem("BLOCKED", "file:///p/x/", "noBuildSystemFound", &[]);
-        assert!(none.contains("no supported build system"), "{none}");
-        // Unknown reasons are shown as they are rather than hidden.
-        let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[]);
-        assert!(other.contains("somethingNew"), "{other}");
-    }
-
-    #[test]
-    fn failed_imports_point_at_the_server_log() {
-        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[]);
-        assert!(f.contains("/p/app/") && f.contains("Gradle sync failed") && f.contains("server log"), "{f}");
+    fn requests_from_the_server_are_not_replayed() {
+        // Only notifications are kept; a request has an id and is answered on the spot.
+        let mut core = core_for_test();
+        core.observe(&json!({"jsonrpc": "2.0", "id": 7, "method": "intellij/workspaceImportState", "params": {}}));
+        assert_eq!(core.early.as_ref().map(Vec::len), Some(0));
     }
 }

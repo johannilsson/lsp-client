@@ -10,6 +10,8 @@ pub struct FileConfig {
     /// Sent to the server as `initializationOptions` in `initialize`, as given.
     /// Which keys exist is up to the server (kotlin-lsp: `indexDir`, `buildTools`, ...).
     pub initialization_options: Option<toml::Value>,
+    /// Server profile: `auto` (the default), `generic`, or a name from `servers::KNOWN`.
+    pub server_profile: Option<String>,
     /// Duration string, e.g. "30s", "2m"
     pub timeout: Option<String>,
     pub root: Option<String>,

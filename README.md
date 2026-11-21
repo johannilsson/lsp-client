@@ -88,7 +88,7 @@ lsp-client session stop
 | `--host` | `127.0.0.1` | Server host (TCP mode) |
 | `--port` | `9999` | Server port (TCP mode) |
 | `--no-server-stdio-flag` | — | Don't pass `--stdio` to the server process |
-| `--build-tool` | — | Build tool to use when a project has more than one, e.g. `gradle` or `maven` (kotlin-lsp) |
+| `--build-tool` | — | Build tool to use when a project has more than one, e.g. `gradle` or `maven`. Only the `kotlin-lsp` profile uses it; other servers ignore it |
 | `--json` | — | Emit `{"ok": true, "result": ...}` JSON |
 | `--verbose` / `-v` | — | Debug logging to stderr |
 
@@ -117,6 +117,20 @@ With the file in place, starting a session is just:
 ```sh
 lsp-client session start
 ```
+
+## Server profiles
+
+lsp-client works with any language server. What it does for every server stays at the protocol level. Behaviour that only one server needs (its own custom notifications, its own questions, how its output is tidied up) lives in a *profile* and runs only while that server is in use. Today there is one: `kotlin-lsp`, which reports project imports (`intellij/workspaceImportStatus` and `intellij/workspaceImportState`, undocumented messages), and which every other server never sees.
+
+The profile is chosen after the server answers `initialize`: from the server's own `serverInfo.name` (kotlin-lsp calls itself "IntelliJ Language Server by JetBrains"), or by name with `--server-profile` / `server_profile` in `.lsp-client.toml`:
+
+| Value | Meaning |
+|---|---|
+| `auto` (default) | match the server by what it calls itself; no match means `generic` |
+| `generic` | turn every profile off |
+| `kotlin-lsp` | use that profile even if the server does not identify itself |
+
+`lsp-client session status` shows the profile in use. The code is in `src/servers/`, one module per server.
 
 ## Server-specific setup
 

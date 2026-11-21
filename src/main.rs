@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod format;
+mod servers;
 mod session;
 mod session_file;
 mod transport;
@@ -63,6 +64,10 @@ struct Cli {
     /// answers that question (the server remembers the answer for the workspace)
     #[arg(long, global = true, value_name = "TOOL")]
     build_tool: Option<String>,
+    /// Behaviour specific to one server: auto (default: chosen from what the server calls
+    /// itself), generic (none), or kotlin-lsp
+    #[arg(long, global = true, value_name = "NAME")]
+    server_profile: Option<String>,
 
     /// Maximum time to wait for a response (e.g. 10s, 2m). Default: no timeout.
     #[arg(long, global = true, value_parser = parse_duration)]
@@ -238,6 +243,7 @@ struct EffectiveConfig {
     build_tool: Option<String>,
     /// `[initialization_options]` from the config file, as JSON.
     initialization_options: Option<serde_json::Value>,
+    server_profile: Option<String>,
     timeout: Option<std::time::Duration>,
 }
 
@@ -284,6 +290,7 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         initialization_options: file_config
             .initialization_options
             .and_then(|v| serde_json::to_value(v).ok()),
+        server_profile: cli.server_profile.clone().or(file_config.server_profile),
         timeout,
     }
 }
@@ -292,6 +299,12 @@ fn main() {
     let cli = Cli::parse();
     let effective = build_effective_config(&cli);
     let root = &effective.root;
+    if let Some(name) = &effective.server_profile
+        && let Err(e) = servers::select(Some(name), None)
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(2);
+    }
 
     // ---- Session management commands (no LSP session needed) ---------------
 
@@ -356,6 +369,7 @@ fn main() {
                                     "language_id": info.language_id,
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
+                                    "profile":     info.profile,
                                 })
                             );
                         } else {
@@ -365,6 +379,9 @@ fn main() {
                             println!("server:      {}", info.server);
                             println!("language_id: {}", info.language_id);
                             println!("uptime:      {uptime}");
+                            if !info.profile.is_empty() {
+                                println!("profile:     {}", info.profile);
+                            }
                         }
                     }
                     Some(_) => {
@@ -441,6 +458,7 @@ fn main() {
                     daemon::DaemonOptions {
                         build_tool: effective.build_tool.clone(),
                         initialization_options: effective.initialization_options.clone(),
+                        profile: effective.server_profile.clone(),
                     },
                 ) {
                     eprintln!("daemon error: {e}");
@@ -879,6 +897,9 @@ fn start_daemon(
     }
     if let Some(tool) = &effective.build_tool {
         cmd.arg("--build-tool").arg(tool);
+    }
+    if let Some(profile) = &effective.server_profile {
+        cmd.arg("--server-profile").arg(profile);
     }
     if verbose {
         cmd.arg("--verbose");
