@@ -266,6 +266,8 @@ struct EffectiveConfig {
     language_id: Option<String>,
     no_server_stdio_flag: bool,
     build_tool: Option<String>,
+    /// `[initialization_options]` from the config file, as JSON.
+    initialization_options: Option<serde_json::Value>,
     timeout: Option<std::time::Duration>,
 }
 
@@ -309,6 +311,9 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         no_server_stdio_flag: cli.no_server_stdio_flag
             || file_config.no_server_stdio_flag.unwrap_or(false),
         build_tool: cli.build_tool.clone().or(file_config.build_tool),
+        initialization_options: file_config
+            .initialization_options
+            .and_then(|v| serde_json::to_value(v).ok()),
         timeout,
     }
 }
@@ -463,7 +468,10 @@ fn main() {
                     *idle_timeout,
                     cli.verbose,
                     language_id,
-                    effective.build_tool.as_deref(),
+                    daemon::DaemonOptions {
+                        build_tool: effective.build_tool.clone(),
+                        initialization_options: effective.initialization_options.clone(),
+                    },
                 ) {
                     eprintln!("daemon error: {e}");
                     std::process::exit(1);
@@ -565,7 +573,7 @@ fn main() {
         let init_resp = if use_daemon && !matches!(cli.command, Command::Capabilities) {
             serde_json::Value::Null
         } else {
-            session.initialize(root)?
+            session.initialize(root, effective.initialization_options.as_ref())?
         };
 
         // WaitReady: send lsp-client/waitIdle and exit.

@@ -130,10 +130,10 @@ impl LspSession {
         self.transport.send_raw(&msg.to_string())
     }
 
-    pub fn initialize(&mut self, root: &str) -> Result<Value> {
+    pub fn initialize(&mut self, root: &str, init_options: Option<&Value>) -> Result<Value> {
         let root_uri = file_uri(root);
         let basename = Path::new(root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let resp = self.request("initialize", json!({
+        let mut params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -171,7 +171,11 @@ impl LspSession {
                 "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
-        }))?;
+        });
+        if let Some(opts) = init_options {
+            params["initializationOptions"] = opts.clone();
+        }
+        let resp = self.request("initialize", params)?;
         self.notify("initialized", json!({}))?;
         Ok(resp)
     }
