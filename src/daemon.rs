@@ -68,6 +68,9 @@ struct DaemonCore {
     import: ImportState,
     /// Answer for the server's "which build tool?" question (`--build-tool`).
     build_tool: Option<String>,
+    /// The server's own log file, from its "Log file: <path>" log message
+    /// (kotlin-lsp sends one at startup).
+    server_log: Option<String>,
 }
 
 #[derive(Default)]
@@ -105,12 +108,20 @@ impl ImportState {
 /// `message` come from `intellij/workspaceImportState` (`FAILED` or
 /// `BLOCKED`); for blocked folders `message` is the reason id and
 /// `candidates` are the build tools the server found.
-fn describe_import_problem(status: &str, folder: &str, message: &str, candidates: &[String]) -> String {
+fn describe_import_problem(
+    status: &str,
+    folder: &str,
+    message: &str,
+    candidates: &[String],
+    server_log: Option<&str>,
+) -> String {
     let path = folder.strip_prefix("file://").unwrap_or(folder);
     if status != "BLOCKED" {
-        return format!(
-            "project import failed for {path}: {message}. Results will be incomplete; see the server log (--verbose prints its path)."
-        );
+        let log = match server_log {
+            Some(log) => format!("server log: {log}"),
+            None => "see the server log (--verbose prints its path)".to_string(),
+        };
+        return format!("project import failed for {path}: {message}. Results will be incomplete; {log}");
     }
     let why = match message {
         "ambiguousBuildSystem" => format!(
@@ -201,6 +212,14 @@ impl DaemonCore {
             // A created token only counts once it begins: kotlin-lsp creates
             // tokens and then cancels the create request without using them.
             "window/workDoneProgress/create" => {}
+            "window/logMessage" => {
+                if let Some(path) = msg["params"]["message"].as_str().and_then(|m| m.strip_prefix("Log file: ")) {
+                    self.server_log = Some(path.trim().to_owned());
+                }
+                if self.verbose {
+                    eprintln!("[DAEMON] <<< {method} {}", msg["params"]);
+                }
+            }
             "intellij/workspaceImportStatus" => {
                 if !self.import.finished {
                     self.import.expected = true;
@@ -218,6 +237,7 @@ impl DaemonCore {
                 self.import.finished = params["phase"].as_str() == Some("FINISHED");
                 if self.import.finished {
                     let blocked = &self.import.blocked;
+                    let server_log = self.server_log.clone();
                     self.import.failures = params["folders"]
                         .as_array()
                         .into_iter()
@@ -238,6 +258,7 @@ impl DaemonCore {
                                 folder,
                                 f["message"].as_str().unwrap_or("import failed"),
                                 &candidates,
+                                server_log.as_deref(),
                             )
                         })
                         .collect();
@@ -580,6 +601,7 @@ pub fn run_daemon(
         pending_progress: HashSet::new(),
         import: ImportState::default(),
         build_tool: options.build_tool.clone(),
+        server_log: None,
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -668,6 +690,7 @@ pub fn run_daemon(
         socket: socket_path.clone(),
         started_at: unix_timestamp(),
         initialized: true,
+        server_log: core.server_log.clone(),
     };
     info.save()?;
 
@@ -772,12 +795,13 @@ mod tests {
             "file:///p/amb/",
             "ambiguousBuildSystem",
             &["gradle".to_string(), "maven".to_string()],
+            None,
         );
         assert!(amb.contains("/p/amb/") && amb.contains("gradle, maven") && amb.contains("--build-tool"), "{amb}");
-        let none = describe_import_problem("BLOCKED", "file:///p/x/", "noBuildSystemFound", &[]);
+        let none = describe_import_problem("BLOCKED", "file:///p/x/", "noBuildSystemFound", &[], None);
         assert!(none.contains("no supported build system"), "{none}");
         // Unknown reasons are shown as they are rather than hidden.
-        let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[]);
+        let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[], None);
         assert!(other.contains("somethingNew"), "{other}");
     }
 
@@ -795,7 +819,38 @@ mod tests {
 
     #[test]
     fn failed_imports_point_at_the_server_log() {
-        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[]);
+        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[], None);
         assert!(f.contains("/p/app/") && f.contains("Gradle sync failed") && f.contains("server log"), "{f}");
+    }
+
+    #[test]
+    fn failed_imports_name_the_log_file_when_the_server_announced_one() {
+        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[], Some("/tmp/x/server.log"));
+        assert!(f.ends_with("server log: /tmp/x/server.log"), "{f}");
+    }
+
+    fn core_for_test() -> DaemonCore {
+        let (_tx, rx) = mpsc::channel();
+        DaemonCore {
+            server_writer: Box::new(io::sink()),
+            server_rx: rx,
+            next_id: 1,
+            verbose: false,
+            opened_versions: HashMap::new(),
+            pending_progress: HashSet::new(),
+            import: ImportState::default(),
+            build_tool: None,
+            server_log: None,
+        }
+    }
+
+    #[test]
+    fn the_server_log_path_is_taken_from_its_log_message() {
+        let mut core = core_for_test();
+        let log = |m: &str| json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"message": m, "type": 3}});
+        assert!(core.observe(&log("Process started with ServerLaunchConfig(...)")));
+        assert_eq!(core.server_log, None);
+        core.observe(&log("Log file: /tmp/idea-system1/system/log/intellij-server.log"));
+        assert_eq!(core.server_log.as_deref(), Some("/tmp/idea-system1/system/log/intellij-server.log"));
     }
 }
