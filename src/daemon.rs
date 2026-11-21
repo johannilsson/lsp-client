@@ -60,6 +60,22 @@ struct DaemonCore {
     /// Kept across calls: servers such as kotlin-lsp run a Gradle import that
     /// can stay silent for minutes while its token is still open.
     pending_progress: HashSet<Value>,
+    /// IntelliJ-based servers (kotlin-lsp) announce a project import with
+    /// `intellij/workspaceImportStatus` and report its outcome with
+    /// `intellij/workspaceImportState`.  The import can start several seconds
+    /// after `initialized`, and may report no `$/progress` at all, so once a
+    /// server has announced one, idle also requires the import to be finished.
+    import: ImportState,
+}
+
+#[derive(Default)]
+struct ImportState {
+    /// The server announced a project import.
+    expected: bool,
+    /// The server reported the import as finished (successfully or not).
+    finished: bool,
+    /// One line per folder whose import failed, from the last finished import.
+    failures: Vec<String>,
 }
 
 impl DaemonCore {
@@ -105,9 +121,38 @@ impl DaemonCore {
             return false;
         };
         match method {
-            "window/workDoneProgress/create" => {
-                if let Some(token) = msg["params"].get("token") {
-                    self.pending_progress.insert(token.clone());
+            // A created token only counts once it begins: kotlin-lsp creates
+            // tokens and then cancels the create request without using them.
+            "window/workDoneProgress/create" => {}
+            "intellij/workspaceImportStatus" => {
+                if !self.import.finished {
+                    self.import.expected = true;
+                }
+                if self.verbose {
+                    eprintln!("[DAEMON] <<< {method} {}", msg["params"]);
+                }
+            }
+            "intellij/workspaceImportState" => {
+                let params = &msg["params"];
+                self.import.expected = true;
+                self.import.finished = params["phase"].as_str() == Some("FINISHED");
+                if self.import.finished {
+                    self.import.failures = params["folders"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|f| f["status"].as_str() == Some("FAILED"))
+                        .map(|f| {
+                            format!(
+                                "{}: {}",
+                                f["folderUri"].as_str().unwrap_or("?"),
+                                f["message"].as_str().unwrap_or("import failed")
+                            )
+                        })
+                        .collect();
+                }
+                if self.verbose {
+                    eprintln!("[DAEMON] <<< {method} {params}");
                 }
             }
             "$/progress" => {
@@ -134,7 +179,9 @@ impl DaemonCore {
             }
             _ => {
                 if self.verbose {
-                    eprintln!("[DAEMON] <<< {method}");
+                    let params = msg["params"].to_string();
+                    let cut = params.char_indices().nth(400).map_or(params.len(), |(i, _)| i);
+                    eprintln!("[DAEMON] <<< {method} {}", &params[..cut]);
                 }
             }
         }
@@ -171,7 +218,10 @@ impl DaemonCore {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     let quiet = last_activity.elapsed();
-                    let idle = self.pending_progress.is_empty() && quiet >= Duration::from_millis(500);
+                    let import_done = !self.import.expected || self.import.finished;
+                    let idle = self.pending_progress.is_empty()
+                        && import_done
+                        && quiet >= Duration::from_millis(500);
                     let gave_up = !strict && quiet >= Duration::from_secs(2);
                     if idle || gave_up {
                         return idle;
@@ -272,7 +322,10 @@ fn handle_connection(
                     .map(Duration::from_millis)
                     .unwrap_or(Duration::from_secs(300));
                 let idle = core.wait_for_idle(max_wait, true);
-                let result = if idle { "idle" } else { "timeout" };
+                let result = json!({
+                    "status": if idle { "idle" } else { "timeout" },
+                    "importFailures": core.import.failures,
+                });
                 let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
                 let _ = send_framed(&mut writer, &resp);
             }
@@ -419,6 +472,7 @@ pub fn run_daemon(
         verbose,
         opened_versions: HashMap::new(),
         pending_progress: HashSet::new(),
+        import: ImportState::default(),
     };
 
     // ---- LSP initialisation -------------------------------------------------
