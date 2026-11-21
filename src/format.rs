@@ -116,7 +116,61 @@ pub fn format_capabilities(caps: &Value) -> String {
     if lines.is_empty() { "No capabilities reported.".into() } else { lines.join("\n") }
 }
 
+/// Decode `%XX` escapes (as in a URI query string).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Rewrite markdown links whose target is an editor `command:` URI, which no
+/// CLI caller can follow.  kotlin-lsp's `command:jetbrains.navigateToLocation?
+/// ["<uri>",line,col]` becomes `text (path:line:col)` (1-based); any other
+/// command link is reduced to its text.
+fn strip_command_links(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(i) = rest.find("](command:") {
+        let (Some(open), Some(close)) = (rest[..i].rfind('['), rest[i..].find(')').map(|j| i + j)) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..i]);
+        let target = &rest[i + 2..close];
+        if let Some(args) = target.strip_prefix("command:jetbrains.navigateToLocation?")
+            && let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&percent_decode(args))
+            && let (Some(uri), Some(line), Some(col)) = (
+                a.first().and_then(|v| v.as_str()),
+                a.get(1).and_then(|v| v.as_u64()),
+                a.get(2).and_then(|v| v.as_u64()),
+            )
+        {
+            out.push_str(&format!(" ({}:{}:{})", uri_to_path(uri), line + 1, col + 1));
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn format_hover(resp: &Value) -> String {
+    strip_command_links(&format_hover_raw(resp))
+}
+
+fn format_hover_raw(resp: &Value) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No hover information found.".into();
     };
@@ -218,7 +272,17 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
     if arr.is_empty() {
         return "No symbols found.".into();
     }
+    // kotlin-lsp can list the same declaration once per source set that
+    // contains it, and again from the project's own compiled classes jar under
+    // build/intermediates/ (Android). Show each source declaration once.
+    let mut seen = std::collections::HashSet::new();
+    let is_own_build_output = |s: &&Value| {
+        let uri = s["location"]["uri"].as_str().unwrap_or("");
+        uri.starts_with("jar:") && uri.contains("/build/intermediates/")
+    };
     arr.iter()
+        .filter(|s| !is_own_build_output(s))
+        .filter(|s| seen.insert((s["name"].to_string(), s["kind"].to_string(), s["location"].to_string())))
         .map(|s| {
             let kind = symbol_kind(s["kind"].as_u64().unwrap_or(0));
             let name = s["name"].as_str().unwrap_or("?");
@@ -569,4 +633,32 @@ pub fn format_completion(resp: &Value) -> String {
         lines.push(format!("... and {} more", items.len() - 30));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn navigate_link_becomes_path() {
+        let md = "From class: [`a.B`](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%2FB.java%22%2C5%2C19%5D)\nmore";
+        assert_eq!(strip_command_links(md), "From class: `a.B` (/x/B.java:6:20)\nmore");
+    }
+
+    #[test]
+    fn other_command_link_keeps_text_and_normal_links_stay() {
+        let md = "[run](command:foo?x) and [docs](https://example.com)";
+        assert_eq!(strip_command_links(md), "run and [docs](https://example.com)");
+    }
+
+    #[test]
+    fn workspace_symbols_are_deduplicated() {
+        let sym = json!({"name": "f", "kind": 12, "containerName": "p",
+            "location": {"uri": "file:///a.kt", "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 5}}}});
+        let mut own_jar = sym.clone();
+        own_jar["location"]["uri"] = json!("jar:///p/app/build/intermediates/x/classes.jar!/AKt.class");
+        let out = format_workspace_symbols(&json!({"result": [sym.clone(), sym, own_jar]}));
+        assert_eq!(out.lines().count(), 1, "{out}");
+    }
 }
