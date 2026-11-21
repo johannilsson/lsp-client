@@ -7,7 +7,7 @@ mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::{IdleResult, LspSession};
+use session::{IdleResult, LspSession, WaitOutcome};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
@@ -298,16 +298,31 @@ fn main() {
                             .language_id
                             .as_deref()
                             .unwrap_or(&info.language_id);
-                        if let Err(e) = wait_for_daemon_ready(
+                        // The daemon keeps running either way; the exit code
+                        // matches `session wait-ready` (2 = timed out,
+                        // 3 = project import failed).
+                        match wait_for_daemon_ready(
                             &info.socket,
                             wait_file.as_deref(),
                             lang,
                             cli.verbose,
                             effective.timeout,
                         ) {
-                            eprintln!("Warning: wait-for-idle failed: {e}");
-                        } else {
-                            eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            Err(e) => {
+                                eprintln!("Warning: wait-for-idle failed: {e}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.idle => {
+                                eprintln!("Warning: server still busy (indexing not finished) for {root}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.import_failures.is_empty() => {
+                                outcome.warn_import_failures();
+                                std::process::exit(3);
+                            }
+                            Ok(_) => {
+                                eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            }
                         }
                     }
                 return;
@@ -514,9 +529,14 @@ fn main() {
             &cli.command
         {
             if use_daemon {
-                if !session.wait_idle_request(*wait_timeout)? {
+                let outcome = session.wait_idle_request(*wait_timeout)?;
+                if !outcome.idle {
                     eprintln!("Timed out waiting for server to become idle.");
                     std::process::exit(2);
+                }
+                if !outcome.import_failures.is_empty() {
+                    outcome.warn_import_failures();
+                    std::process::exit(3);
                 }
             } else {
                 session.wait_for_index(*wait_timeout);
@@ -572,9 +592,11 @@ fn main() {
             if cli.wait_for_index && use_daemon {
                 let wait_dur =
                     effective.timeout.unwrap_or(std::time::Duration::from_secs(300));
-                if !session.wait_idle_request(wait_dur)? && cli.verbose {
+                let outcome = session.wait_idle_request(wait_dur)?;
+                if !outcome.idle && cli.verbose {
                     eprintln!("[DEBUG] server still busy after {wait_dur:?}; querying anyway");
                 }
+                outcome.warn_import_failures();
                 // Restore the configured timeout for subsequent queries.
                 session.transport.set_read_timeout(effective.timeout);
             }
@@ -878,7 +900,7 @@ fn wait_for_daemon_ready(
     language_id: &str,
     verbose: bool,
     timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
     let max_wait = timeout.unwrap_or(std::time::Duration::from_secs(300));
     let transport = Transport::unix_socket(socket)?;
     transport.set_read_timeout(Some(max_wait));
@@ -888,10 +910,7 @@ fn wait_for_daemon_ready(
         let abs = abs_path(f);
         session.did_open(&abs, language_id)?;
     }
-    if !session.wait_idle_request(max_wait)? {
-        return Err(format!("server still busy after {max_wait:?} (indexing not finished)").into());
-    }
-    Ok(())
+    session.wait_idle_request(max_wait)
 }
 
 #[cfg(not(unix))]
@@ -901,7 +920,7 @@ fn wait_for_daemon_ready(
     _language_id: &str,
     _verbose: bool,
     _timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
     Err("Unix sockets not available on this platform".into())
 }
 

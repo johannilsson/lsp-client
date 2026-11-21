@@ -45,6 +45,10 @@ lsp-client session stop       Stop the daemon
 lsp-client session wait-ready Wait until the server has finished indexing
 ```
 
+`session wait-ready` and `session start --wait` exit with 2 if the server is still busy when the timeout runs out, and with 3 if the server reported a failed project import (kotlin-lsp's Gradle/Maven sync). After a failed import, queries return little or nothing. The daemon keeps running in both cases.
+
+kotlin-lsp keeps the imported project model between runs and only imports again when the build files change. After a restart it reuses even a failed import, without reporting it again: fix the build, then edit or touch a build file, or open the project from a fresh path.
+
 Line and column numbers are 1-based.
 
 ## Daemon workflow (recommended)
