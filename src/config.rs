@@ -5,6 +5,8 @@ pub struct FileConfig {
     pub server: Option<String>,
     pub language_id: Option<String>,
     pub no_server_stdio_flag: Option<bool>,
+    /// Build tool to use when a project has more than one (e.g. "gradle" or "maven").
+    pub build_tool: Option<String>,
     /// Server profile: `auto` (the default), `generic`, or a name from `servers::KNOWN`.
     pub server_profile: Option<String>,
     /// Duration string, e.g. "30s", "2m"

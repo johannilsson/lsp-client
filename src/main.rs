@@ -59,6 +59,11 @@ struct Cli {
     #[arg(long, global = true)]
     no_server_stdio_flag: bool,
 
+    /// Build tool to import the project with when it has more than one, e.g. gradle or maven.
+    /// kotlin-lsp asks which to use when a folder has both a Gradle and a Maven build; this
+    /// answers that question (the server remembers the answer for the workspace)
+    #[arg(long, global = true, value_name = "TOOL")]
+    build_tool: Option<String>,
     /// Behaviour specific to one server: auto (default: chosen from what the server calls
     /// itself), generic (none), or kotlin-lsp
     #[arg(long, global = true, value_name = "NAME")]
@@ -259,6 +264,7 @@ struct EffectiveConfig {
     server: Option<String>,
     language_id: Option<String>,
     no_server_stdio_flag: bool,
+    build_tool: Option<String>,
     server_profile: Option<String>,
     timeout: Option<std::time::Duration>,
 }
@@ -302,6 +308,7 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         language_id: cli.language_id.clone().or(file_config.language_id),
         no_server_stdio_flag: cli.no_server_stdio_flag
             || file_config.no_server_stdio_flag.unwrap_or(false),
+        build_tool: cli.build_tool.clone().or(file_config.build_tool),
         server_profile: cli.server_profile.clone().or(file_config.server_profile),
         timeout,
     }
@@ -467,7 +474,10 @@ fn main() {
                     *idle_timeout,
                     cli.verbose,
                     language_id,
-                    effective.server_profile.as_deref(),
+                    daemon::DaemonOptions {
+                        build_tool: effective.build_tool.clone(),
+                        profile: effective.server_profile.clone(),
+                    },
                 ) {
                     eprintln!("daemon error: {e}");
                     std::process::exit(1);
@@ -925,6 +935,9 @@ fn start_daemon(
     cmd.arg("--language-id").arg(language_id);
     if effective.no_server_stdio_flag {
         cmd.arg("--no-server-stdio-flag");
+    }
+    if let Some(tool) = &effective.build_tool {
+        cmd.arg("--build-tool").arg(tool);
     }
     if let Some(profile) = &effective.server_profile {
         cmd.arg("--server-profile").arg(profile);

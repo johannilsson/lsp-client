@@ -27,7 +27,7 @@ impl WaitOutcome {
     /// Print a warning to stderr if the project import failed.
     pub fn warn_import_failures(&self) {
         for f in &self.import_failures {
-            eprintln!("Warning: project import failed for {f}. Results will be incomplete; see the server log (--verbose prints its path).");
+            eprintln!("Warning: {f}");
         }
     }
 }

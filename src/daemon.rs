@@ -70,6 +70,22 @@ struct DaemonCore {
     /// Notifications that arrived before the profile was chosen, to hand to it once
     /// it is. `None` once that has happened.
     early: Option<Vec<Value>>,
+    /// Answer for the server's "which build tool?" question (`--build-tool`), for the
+    /// profiles whose server asks one.
+    build_tool: Option<String>,
+}
+
+/// Answer to a server-initiated request that no profile answered.
+/// `workspace/configuration` needs one entry per requested item; everything else
+/// (`window/workDoneProgress/create`, `client/registerCapability`, ...) takes `null`.
+fn server_request_result(method: &str, params: &Value) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let n = params["items"].as_array().map_or(0, |a| a.len());
+            Value::Array(vec![Value::Null; n])
+        }
+        _ => Value::Null,
+    }
 }
 
 impl DaemonCore {
@@ -164,7 +180,14 @@ impl DaemonCore {
             }
         }
         if let Some(id) = msg.get("id") {
-            let ack = json!({"jsonrpc":"2.0","id":id,"result":server_request_result(method, &msg["params"])});
+            let result = self
+                .profile
+                .answer_request(method, &msg["params"], self.build_tool.as_deref())
+                .unwrap_or_else(|| server_request_result(method, &msg["params"]));
+            if self.verbose && method == "window/showMessageRequest" {
+                eprintln!("[DAEMON] answering {method} with {result}");
+            }
+            let ack = json!({"jsonrpc":"2.0","id":id,"result":result});
             let _ = self.send_raw(&ack);
         }
         true
@@ -215,20 +238,6 @@ impl DaemonCore {
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
-    }
-}
-
-/// Result to send for a server-initiated request.  `workspace/configuration`
-/// must be answered with one entry per requested item; everything else we
-/// receive (`window/workDoneProgress/create`, `client/registerCapability`, ...)
-/// takes `null`.
-fn server_request_result(method: &str, params: &Value) -> Value {
-    match method {
-        "workspace/configuration" => {
-            let n = params["items"].as_array().map_or(0, |a| a.len());
-            Value::Array(vec![Value::Null; n])
-        }
-        _ => Value::Null,
     }
 }
 
@@ -409,6 +418,15 @@ fn handle_connection(
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Settings that only matter to the daemon process.
+#[derive(Default)]
+pub struct DaemonOptions {
+    /// Answer for the server's "which build tool?" question (`--build-tool`).
+    pub build_tool: Option<String>,
+    /// Server profile asked for by name (`--server-profile`); `None` means auto.
+    pub profile: Option<String>,
+}
+
 /// Run the daemon process.  This function blocks until the daemon shuts down
 /// (idle timeout, server crash, or explicit stop request).
 pub fn run_daemon(
@@ -418,7 +436,7 @@ pub fn run_daemon(
     idle_secs: u64,
     verbose: bool,
     language_id: &str,
-    profile: Option<&str>,
+    options: DaemonOptions,
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
@@ -461,6 +479,7 @@ pub fn run_daemon(
         profile: servers::generic(),
         facts: ServerFacts::default(),
         early: Some(Vec::new()),
+        build_tool: options.build_tool.clone(),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -527,7 +546,7 @@ pub fn run_daemon(
 
     // Now the server has said what it is, choose its profile (see `servers`).
     let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
-    core.use_profile(servers::select(profile, server_name)?);
+    core.use_profile(servers::select(options.profile.as_deref(), server_name)?);
     if verbose {
         eprintln!("[DAEMON] server profile: {}", core.profile.name());
     }
@@ -641,6 +660,7 @@ mod tests {
             profile: servers::generic(),
             facts: ServerFacts::default(),
             early: Some(Vec::new()),
+            build_tool: None,
         }
     }
 
@@ -669,6 +689,16 @@ mod tests {
         core.use_profile(servers::generic());
         core.observe(&failed_import());
         assert!(!core.facts.import.expected && core.facts.import.failures.is_empty());
+    }
+
+    #[test]
+    fn the_default_answers_to_server_requests() {
+        // `workspace/configuration` needs one entry per requested item.
+        let cfg = json!({"items": [{}, {}]});
+        assert_eq!(server_request_result("workspace/configuration", &cfg), json!([null, null]));
+        for method in ["window/workDoneProgress/create", "client/registerCapability", "window/showMessageRequest"] {
+            assert_eq!(server_request_result(method, &json!({})), Value::Null, "{method}");
+        }
     }
 
     #[test]

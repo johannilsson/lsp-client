@@ -51,7 +51,14 @@ pub trait ServerProfile: Send {
     /// A message the server sent: a notification, or a request that the daemon
     /// answers by itself. Called for every one, with its method unchanged, so a
     /// profile must ignore what it does not know.
-    fn on_message(&self, _msg: &Value, _facts: &mut ServerFacts) {}
+    fn on_message(&mut self, _msg: &Value, _facts: &mut ServerFacts) {}
+
+    /// The answer to a request from the server, if this profile has one. `None`
+    /// leaves it to the daemon's default (`null`, or the shape the protocol needs).
+    /// `build_tool` is `--build-tool`, for servers that ask which one to use.
+    fn answer_request(&mut self, _method: &str, _params: &Value, _build_tool: Option<&str>) -> Option<Value> {
+        None
+    }
 }
 
 struct Generic;
@@ -71,7 +78,7 @@ pub fn generic() -> Box<dyn ServerProfile> {
 pub fn by_name(name: &str) -> Option<Box<dyn ServerProfile>> {
     match name {
         "generic" | "none" => Some(generic()),
-        "kotlin-lsp" => Some(Box::new(kotlin_lsp::KotlinLsp)),
+        "kotlin-lsp" => Some(Box::new(kotlin_lsp::KotlinLsp::default())),
         _ => None,
     }
 }
@@ -79,7 +86,7 @@ pub fn by_name(name: &str) -> Option<Box<dyn ServerProfile>> {
 /// The profile for a server that called itself `server_info_name` in `initialize`.
 fn detect(server_info_name: Option<&str>) -> Box<dyn ServerProfile> {
     if kotlin_lsp::is_kotlin_lsp(server_info_name) {
-        return Box::new(kotlin_lsp::KotlinLsp);
+        return Box::new(kotlin_lsp::KotlinLsp::default());
     }
     generic()
 }
