@@ -167,6 +167,7 @@ lsp-client query symbols src/Main.kt
 lsp-client --tcp --language-id kotlin --root /my/project query symbols src/Main.kt
 
 # Direct TCP with auto-start: spawn kotlin-lsp over TCP if none is listening
+# (only for servers whose profile knows how to start them that way, see "Server profiles")
 lsp-client --tcp --server kotlin-lsp --language-id kotlin --root /my/project query symbols src/Main.kt
 ```
 
@@ -228,7 +229,7 @@ cargo test --test kotlin_lsp -- --nocapture --test-threads=1
 
 Query commands auto-detect a running daemon for the project root. If a daemon is running, the client connects to it over a Unix socket — no flags needed. The daemon starts the language server once over stdio, pays the startup and indexing cost once, then serves all subsequent calls from the warm session.
 
-Pass `--tcp` to bypass the daemon entirely and connect directly to a TCP language server (e.g. kotlin-lsp on port 9999). This is useful when a server is already running — for example, started by an IDE — and you want to share it. Add `--server <binary>` to auto-start the server if none is listening.
+Pass `--tcp` to bypass the daemon entirely and connect directly to a TCP language server (e.g. kotlin-lsp on port 9999). This is useful when a server is already running — for example, started by an IDE — and you want to share it. Add `--server <binary>` to auto-start the server if none is listening. Starting the server needs to know which flags make it listen on a port, which differs between servers, so it only works for servers whose profile knows them (today kotlin-lsp, recognised by `--server-profile kotlin-lsp` or by its binary name). For any other server, start it yourself and use `--tcp` to connect, or leave `--tcp` out.
 
 ## Known limitations
 

@@ -18,6 +18,14 @@ pub fn is_kotlin_lsp(server_info_name: Option<&str>) -> bool {
     server_info_name.is_some_and(|n| n.contains("IntelliJ Language Server"))
 }
 
+/// True if `bin` (the `--server` value, possibly a path) is a kotlin-lsp launcher:
+/// the Homebrew/standalone `kotlin-lsp`, its old `kotlin-lsp.sh`, or the
+/// `intellij-server` binary inside the archive.
+pub fn is_kotlin_lsp_binary(bin: &str) -> bool {
+    let name = std::path::Path::new(bin).file_name().and_then(|n| n.to_str()).unwrap_or(bin);
+    matches!(name, "kotlin-lsp" | "kotlin-lsp.sh" | "intellij-server")
+}
+
 #[derive(Default)]
 pub struct KotlinLsp {
     /// Folders the server could not import and why, from the latest
@@ -152,6 +160,12 @@ impl ServerProfile for KotlinLsp {
             return true;
         };
         !is_composable_declaration(source, line as usize, col as usize)
+    }
+
+    /// kotlin-lsp serves TCP clients with `--socket host:port`, and keeps running for
+    /// the next one with `--multi-client` (otherwise it exits when the client leaves).
+    fn tcp_start_args(&self, host: &str, port: u16) -> Option<Vec<String>> {
+        Some(vec!["--socket".to_string(), format!("{host}:{port}"), "--multi-client".to_string()])
     }
 
     /// With more than one build tool in a folder the server asks "Use Gradle / Use

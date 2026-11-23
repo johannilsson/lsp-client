@@ -179,3 +179,51 @@ fn an_unknown_profile_name_is_rejected_before_anything_starts() {
     assert!(stderr(&out).contains("unknown server profile 'bogus'"), "stderr: {}", stderr(&out));
 }
 
+/// A TCP port nothing is listening on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+#[test]
+fn tcp_mode_does_not_start_a_server_it_does_not_know_how_to_start() {
+    // `--tcp --server X` starts X when nothing is listening, which needs to know the
+    // flags that make X listen on a port. Only kotlin-lsp's are known; for anything
+    // else lsp-client must say so, not pass it kotlin-lsp's flags.
+    let ws = Workspace::new("tcp-unknown");
+    let port = free_port().to_string();
+    let file = ws.0.join("a.txt");
+    let started = Instant::now();
+    let out = ws.run(&[
+        "--tcp", "--port", &port, "--server", "python3", "--language-id", "plain",
+        "query", "hover", file.to_str().unwrap(), "1", "1",
+    ]);
+    assert_ne!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("does not know which flags") && err.contains("'python3'"), "stderr: {err}");
+    assert!(!err.contains("kotlin-lsp"), "stderr: {err}");
+    // It gave up at once; it did not start python3 and wait for it for 30 s.
+    assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn tcp_mode_with_no_server_to_start_says_so() {
+    let ws = Workspace::new("tcp-none");
+    let port = free_port().to_string();
+    let file = ws.0.join("a.txt");
+    let out = ws.run(&["--tcp", "--port", &port, "--language-id", "plain", "query", "hover", file.to_str().unwrap(), "1", "1"]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("No server listening"), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn an_unknown_profile_name_stops_tcp_mode_too() {
+    let ws = Workspace::new("tcp-bad-profile");
+    let port = free_port().to_string();
+    let file = ws.0.join("a.txt");
+    let out = ws.run(&[
+        "--tcp", "--port", &port, "--server", "python3", "--server-profile", "bogus", "--language-id", "plain",
+        "query", "hover", file.to_str().unwrap(), "1", "1",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+}
+

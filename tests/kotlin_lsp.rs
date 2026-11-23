@@ -173,3 +173,25 @@ fn failed_import_names_the_server_log_and_session_log_shows_it() {
     assert_eq!(tail.status.code(), Some(0), "stderr: {}", stderr(&tail));
     assert!(!tail.stdout.is_empty());
 }
+
+#[test]
+fn tcp_mode_still_starts_kotlin_lsp_when_nothing_is_listening() {
+    if !kotlin_lsp_available() {
+        eprintln!("skipped: kotlin-lsp not on PATH");
+        return;
+    }
+    // `--tcp --server kotlin-lsp` starts the server with its own listening flags, from
+    // its profile (chosen from the binary name, as there is no `serverInfo` yet).
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let p = Project::new("tcp", &[]);
+    let main = p.path().join("src/Main.kt");
+    let out = p.run(&[
+        "--tcp", "--port", &port.to_string(), "--server", "kotlin-lsp", "--language-id", "kotlin",
+        "query", "symbols", main.to_str().unwrap(),
+    ]);
+    // The server keeps running for the next client (`--multi-client`): stop this one.
+    let _ = Command::new("pkill").args(["-f", &format!("socket 127.0.0.1:{port}")]).status();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("main"), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+}
+

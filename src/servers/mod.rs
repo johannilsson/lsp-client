@@ -79,6 +79,14 @@ pub trait ServerProfile: Send {
         None
     }
 
+    /// The arguments that make the server listen on `host:port` instead of speaking
+    /// over stdio, for `--tcp --server <binary>`, which starts the server when nothing
+    /// is listening. `None` if the profile does not know how to start its server that
+    /// way (then lsp-client says so, rather than guessing flags).
+    fn tcp_start_args(&self, _host: &str, _port: u16) -> Option<Vec<String>> {
+        None
+    }
+
     /// Tidy the markdown of a hover answer, before the generic clean-up (which turns
     /// any remaining editor `command:` link into its text).
     fn rewrite_hover(&self, markdown: String) -> String {
@@ -125,6 +133,18 @@ fn detect(server_info_name: Option<&str>) -> Box<dyn ServerProfile> {
         return Box::new(kotlin_lsp::KotlinLsp::default());
     }
     generic()
+}
+
+/// The profile for a server that has not started yet, so there is no `serverInfo`:
+/// the one asked for by name, or (`None` or `auto`) the one that matches the
+/// server's binary name. Used where the profile is needed before `initialize`, such
+/// as starting a server in TCP mode.
+pub fn for_binary(requested: Option<&str>, server_bin: &str) -> Result<Box<dyn ServerProfile>, String> {
+    match requested {
+        None | Some("auto") if kotlin_lsp::is_kotlin_lsp_binary(server_bin) => Ok(Box::new(kotlin_lsp::KotlinLsp::default())),
+        None | Some("auto") => Ok(generic()),
+        Some(name) => select(Some(name), None),
+    }
 }
 
 /// Choose the profile: the one asked for by name, or (`None` or `auto`) the one that
@@ -180,6 +200,27 @@ mod tests {
         assert_eq!(st.state(), "ok");
         st.failures.push("project not imported for /p/".into());
         assert_eq!(st.state(), "problem");
+    }
+
+    #[test]
+    fn a_server_that_has_not_started_is_recognised_by_its_binary_name() {
+        for bin in ["kotlin-lsp", "/opt/kotlin-lsp/bin/intellij-server", "kotlin-lsp.sh"] {
+            assert_eq!(for_binary(None, bin).unwrap().name(), "kotlin-lsp", "{bin}");
+        }
+        assert_eq!(for_binary(None, "rust-analyzer").unwrap().name(), "generic");
+        // A profile asked for by name wins over the binary name, either way.
+        assert_eq!(for_binary(Some("generic"), "kotlin-lsp").unwrap().name(), "generic");
+        assert_eq!(for_binary(Some("kotlin-lsp"), "my-wrapper").unwrap().name(), "kotlin-lsp");
+        assert!(for_binary(Some("bogus"), "x").is_err());
+    }
+
+    #[test]
+    fn only_a_profile_that_knows_the_flags_can_start_a_server_in_tcp_mode() {
+        assert_eq!(generic().tcp_start_args("127.0.0.1", 9999), None);
+        assert_eq!(
+            by_name("kotlin-lsp").unwrap().tcp_start_args("127.0.0.1", 9999),
+            Some(vec!["--socket".to_string(), "127.0.0.1:9999".to_string(), "--multi-client".to_string()])
+        );
     }
 
     #[test]

@@ -590,7 +590,15 @@ fn main() {
     } else {
         // --tcp mode: connect directly over TCP, bypassing the daemon.
         // server_bin is optional — if provided and connection is refused, auto-starts the server.
-        Transport::tcp_with_autostart(&cli.host, cli.port, effective.server.as_deref(), cli.verbose)
+        // The server is not running yet, so there is no `serverInfo` to pick its profile from:
+        // the profile asked for, or else the server's binary name, says how to start it.
+        let autostart = match effective.server.as_deref() {
+            Some(bin) => servers::for_binary(effective.server_profile.as_deref(), bin)
+                .map(|profile| Some(transport::AutoStart { bin, args: profile.tcp_start_args(&cli.host, cli.port) }))
+                .map_err(Box::<dyn std::error::Error>::from),
+            None => Ok(None),
+        };
+        autostart.and_then(|a| Transport::tcp_with_autostart(&cli.host, cli.port, a, cli.verbose))
     };
 
     let transport = match transport {
