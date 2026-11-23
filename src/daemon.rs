@@ -423,6 +423,8 @@ fn handle_connection(
 pub struct DaemonOptions {
     /// Answer for the server's "which build tool?" question (`--build-tool`).
     pub build_tool: Option<String>,
+    /// `initializationOptions` for `initialize` (`[initialization_options]` in the config file).
+    pub initialization_options: Option<Value>,
     /// Server profile asked for by name (`--server-profile`); `None` means auto.
     pub profile: Option<String>,
 }
@@ -497,9 +499,7 @@ pub fn run_daemon(
         eprintln!("[DAEMON] initialising {server_bin} for {canonical_root}");
     }
 
-    let init_resp = core.request(
-        "initialize",
-        json!({
+    let mut init_params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -541,8 +541,11 @@ pub fn run_daemon(
                 "window": {"workDoneProgress": true},
             },
             "workspaceFolders": [{"uri": root_uri, "name": basename}],
-        }),
-    )?;
+    });
+    if let Some(opts) = &options.initialization_options {
+        init_params["initializationOptions"] = opts.clone();
+    }
+    let init_resp = core.request("initialize", init_params)?;
 
     // Now the server has said what it is, choose its profile (see `servers`).
     let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
