@@ -12,6 +12,8 @@ pub struct SessionInfo {
     pub socket: String,
     pub started_at: u64, // Unix timestamp seconds
     pub initialized: bool,
+    /// The server's own log file, if it announced one (kotlin-lsp does).
+    pub server_log: Option<String>,
     /// Name of the server profile in use (see `servers`); empty in session files
     /// written before profiles existed.
     pub profile: String,
@@ -54,6 +56,7 @@ impl SessionInfo {
             socket: v["socket"].as_str()?.to_owned(),
             started_at: v["started_at"].as_u64().unwrap_or(0),
             initialized: v["initialized"].as_bool().unwrap_or(false),
+            server_log: v["server_log"].as_str().map(str::to_owned),
             profile: v["profile"].as_str().unwrap_or("").to_owned(),
         })
     }
@@ -71,6 +74,7 @@ impl SessionInfo {
             "socket":      self.socket,
             "started_at":  self.started_at,
             "initialized": self.initialized,
+            "server_log":  self.server_log,
             "profile":     self.profile,
         });
         std::fs::write(path, v.to_string())

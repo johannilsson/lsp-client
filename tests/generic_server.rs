@@ -121,10 +121,16 @@ fn another_server_sending_kotlin_lsps_messages_is_not_treated_as_kotlin_lsp() {
     }
     // It reports a failed import in kotlin-lsp's own words, but it is not kotlin-lsp.
     let ws = Workspace::new("not-kotlin");
-    let out = ws.start_fake(&[], &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", "some-other-server")]);
+    let out = ws.start_fake(
+        &[],
+        &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", "some-other-server"), ("FAKE_LSP_LOG_FILE", "/tmp/fake.log")],
+    );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(!stderr(&out).contains("import failed"), "stderr: {}", stderr(&out));
-    assert!(status_stdout(&ws).contains("profile:     generic"));
+    let status = status_stdout(&ws);
+    assert!(status.contains("profile:     generic"));
+    // Its "Log file:" message is not taken at its word either.
+    assert!(!status.contains("server log:"), "{status}");
 }
 
 #[test]
@@ -134,10 +140,16 @@ fn a_server_that_calls_itself_kotlin_lsp_gets_the_kotlin_lsp_profile() {
         return;
     }
     let ws = Workspace::new("is-kotlin");
-    let out = ws.start_fake(&[], &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", KOTLIN_NAME)]);
+    let out = ws.start_fake(
+        &[],
+        &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", KOTLIN_NAME), ("FAKE_LSP_LOG_FILE", "/tmp/fake.log")],
+    );
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("Gradle sync failed"), "stderr: {}", stderr(&out));
-    assert!(status_stdout(&ws).contains("profile:     kotlin-lsp"));
+    // The log file was announced before `initialize` was answered, so this also
+    // checks that what arrives before the profile is known reaches it.
+    assert!(stderr(&out).contains("Gradle sync failed") && stderr(&out).contains("server log: /tmp/fake.log"), "stderr: {}", stderr(&out));
+    let status = status_stdout(&ws);
+    assert!(status.contains("profile:     kotlin-lsp") && status.contains("server log:  /tmp/fake.log"), "{status}");
 }
 
 #[test]

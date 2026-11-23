@@ -7,6 +7,8 @@ token ("Indexing") that it never ends, which some real servers do.
 
 Environment variables change what it does:
 - FAKE_LSP_SERVER_NAME: send this as `serverInfo.name` in the `initialize` answer.
+- FAKE_LSP_LOG_FILE: announce this as its log file ("Log file: <path>") in a
+  `window/logMessage` sent before the `initialize` answer, as kotlin-lsp does.
 - FAKE_LSP_INTELLIJ=1: also send kotlin-lsp's `intellij/workspaceImport*`
   notifications, reporting a failed import, as kotlin-lsp would.
 """
@@ -39,6 +41,9 @@ while True:
     m = read()
     method = m.get("method")
     if method == "initialize":
+        if os.environ.get("FAKE_LSP_LOG_FILE"):
+            send({"jsonrpc": "2.0", "method": "window/logMessage",
+                  "params": {"type": 3, "message": "Log file: " + os.environ["FAKE_LSP_LOG_FILE"]}})
         result = {"capabilities": {"hoverProvider": True}}
         if os.environ.get("FAKE_LSP_SERVER_NAME"):
             result["serverInfo"] = {"name": os.environ["FAKE_LSP_SERVER_NAME"], "version": "1"}

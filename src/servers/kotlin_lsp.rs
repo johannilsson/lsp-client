@@ -3,7 +3,8 @@
 //! Its project import is not part of the protocol: it announces an import with
 //! `intellij/workspaceImportStatus`, reports the outcome with
 //! `intellij/workspaceImportState`, and when a folder has more than one build tool
-//! it asks which to use with `window/showMessageRequest`. The notifications are
+//! it asks which to use with `window/showMessageRequest`. It also announces its
+//! own log file in a `window/logMessage` ("Log file: <path>"). The notifications are
 //! undocumented and were read off the server's own messages (tested with
 //! 271.2085.0), so everything that depends on them is here, and only runs when
 //! this profile is in use.
@@ -32,6 +33,12 @@ impl ServerProfile for KotlinLsp {
 
     fn on_message(&mut self, msg: &Value, facts: &mut ServerFacts) {
         match msg.get("method").and_then(|m| m.as_str()) {
+            // "Log file: <path>", sent once at startup.
+            Some("window/logMessage") => {
+                if let Some(path) = msg["params"]["message"].as_str().and_then(|m| m.strip_prefix("Log file: ")) {
+                    facts.server_log = Some(path.trim().to_owned());
+                }
+            }
             // "I am going to import": the import can start several seconds after
             // `initialized` and may report no `$/progress` at all, so from now on
             // being idle also means the import has finished.
@@ -49,6 +56,7 @@ impl ServerProfile for KotlinLsp {
                 facts.import.expected = true;
                 facts.import.finished = params["phase"].as_str() == Some("FINISHED");
                 if facts.import.finished {
+                    let server_log = facts.server_log.clone();
                     facts.import.failures = params["folders"]
                         .as_array()
                         .into_iter()
@@ -70,6 +78,7 @@ impl ServerProfile for KotlinLsp {
                                 folder,
                                 f["message"].as_str().unwrap_or("import failed"),
                                 &candidates,
+                                server_log.as_deref(),
                             )
                         })
                         .collect();
@@ -100,12 +109,20 @@ impl ServerProfile for KotlinLsp {
 /// `message` come from `intellij/workspaceImportState` (`FAILED` or
 /// `BLOCKED`); for blocked folders `message` is the reason id and
 /// `candidates` are the build tools the server found.
-fn describe_import_problem(status: &str, folder: &str, message: &str, candidates: &[String]) -> String {
+fn describe_import_problem(
+    status: &str,
+    folder: &str,
+    message: &str,
+    candidates: &[String],
+    server_log: Option<&str>,
+) -> String {
     let path = folder.strip_prefix("file://").unwrap_or(folder);
     if status != "BLOCKED" {
-        return format!(
-            "project import failed for {path}: {message}. Results will be incomplete; see the server log (--verbose prints its path)."
-        );
+        let log = match server_log {
+            Some(log) => format!("server log: {log}"),
+            None => "see the server log (--verbose prints its path)".to_string(),
+        };
+        return format!("project import failed for {path}: {message}. Results will be incomplete; {log}");
     }
     let why = match message {
         "ambiguousBuildSystem" => format!(
@@ -228,19 +245,57 @@ mod tests {
             "file:///p/amb/",
             "ambiguousBuildSystem",
             &["gradle".to_string(), "maven".to_string()],
+            None,
         );
         assert!(amb.contains("/p/amb/") && amb.contains("gradle, maven") && amb.contains("--build-tool"), "{amb}");
-        let none = describe_import_problem("BLOCKED", "file:///p/x/", "noBuildSystemFound", &[]);
+        let none = describe_import_problem("BLOCKED", "file:///p/x/", "noBuildSystemFound", &[], None);
         assert!(none.contains("no supported build system"), "{none}");
         // Unknown reasons are shown as they are rather than hidden.
-        let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[]);
+        let other = describe_import_problem("BLOCKED", "file:///p/x/", "somethingNew", &[], None);
         assert!(other.contains("somethingNew"), "{other}");
     }
 
     #[test]
     fn failed_imports_point_at_the_server_log() {
-        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[]);
+        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[], None);
         assert!(f.contains("/p/app/") && f.contains("Gradle sync failed") && f.contains("server log"), "{f}");
+    }
+
+    #[test]
+    fn failed_imports_name_the_log_file_when_the_server_announced_one() {
+        let f = describe_import_problem("FAILED", "file:///p/app/", "Gradle sync failed", &[], Some("/tmp/x/server.log"));
+        assert!(f.ends_with("server log: /tmp/x/server.log"), "{f}");
+    }
+
+    fn log_message(m: &str) -> Value {
+        json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"message": m, "type": 3}})
+    }
+
+    #[test]
+    fn the_server_log_path_is_taken_from_its_log_message() {
+        let mut kt = KotlinLsp::default();
+        let mut facts = ServerFacts::default();
+        kt.on_message(&log_message("Process started with ServerLaunchConfig(...)"), &mut facts);
+        assert_eq!(facts.server_log, None);
+        kt.on_message(&log_message("Log file: /tmp/idea-system1/system/log/intellij-server.log"), &mut facts);
+        assert_eq!(facts.server_log.as_deref(), Some("/tmp/idea-system1/system/log/intellij-server.log"));
+    }
+
+    #[test]
+    fn the_log_path_reaches_the_failure_message() {
+        let mut kt = KotlinLsp::default();
+        let mut facts = ServerFacts::default();
+        kt.on_message(&log_message("Log file: /tmp/x/server.log"), &mut facts);
+        kt.on_message(&state("FINISHED", "FAILED", "Gradle sync failed"), &mut facts);
+        assert!(facts.import.failures[0].ends_with("server log: /tmp/x/server.log"), "{:?}", facts.import.failures);
+    }
+
+    #[test]
+    fn another_server_announcing_a_log_file_is_not_taken_at_its_word() {
+        let mut facts = ServerFacts::default();
+        let mut generic = servers::generic();
+        generic.on_message(&log_message("Log file: /tmp/elsewhere.log"), &mut facts);
+        assert_eq!(facts.server_log, None);
     }
 
     #[test]

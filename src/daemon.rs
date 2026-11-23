@@ -595,6 +595,7 @@ pub fn run_daemon(
         socket: socket_path.clone(),
         started_at: unix_timestamp(),
         initialized: true,
+        server_log: core.facts.server_log.clone(),
         profile: core.profile.name().to_owned(),
     };
     info.save()?;

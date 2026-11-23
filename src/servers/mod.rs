@@ -57,6 +57,8 @@ impl ImportState {
 #[derive(Default)]
 pub struct ServerFacts {
     pub import: ImportState,
+    /// The server's own log file, if it announces one.
+    pub server_log: Option<String>,
 }
 
 /// Hooks a profile can override. Every hook has a do-nothing default, so the

@@ -238,6 +238,14 @@ enum SessionCommand {
     /// Stop the running LSP session daemon for this workspace.
     Stop,
 
+    /// Print the end of the language server's own log file (for servers that
+    /// announce one, such as kotlin-lsp). `session status` shows the path.
+    Log {
+        /// Number of lines to print
+        #[arg(long, short = 'n', default_value_t = 50)]
+        lines: usize,
+    },
+
     /// Wait until the LSP server has finished indexing (no pending progress).
     ///
     /// Useful in scripts: `lsp-client session wait-ready && lsp-client query hover ...`
@@ -394,6 +402,7 @@ fn main() {
                                     "language_id": info.language_id,
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
+                                    "server_log":  info.server_log,
                                     "import": daemon.as_ref().map(|d| serde_json::json!({
                                         "state":    d.import_state,
                                         "problems": d.import_problems,
@@ -411,6 +420,9 @@ fn main() {
                             if !info.profile.is_empty() {
                                 println!("profile:     {}", info.profile);
                             }
+                            if let Some(log) = &info.server_log {
+                                println!("server log:  {log}");
+                            }
                             match &daemon {
                                 Some(d) => {
                                     let label = match d.import_state.as_str() {
@@ -426,11 +438,17 @@ fn main() {
                             }
                         }
                     }
-                    Some(_) => {
+                    Some(info) => {
                         if cli.json {
-                            println!("{}", serde_json::json!({"status": "dead"}));
+                            println!(
+                                "{}",
+                                serde_json::json!({"status": "dead", "server_log": info.server_log})
+                            );
                         } else {
                             eprintln!("status:      dead (stale session)");
+                            if let Some(log) = &info.server_log {
+                                eprintln!("server log:  {log}");
+                            }
                         }
                         std::process::exit(1);
                     }
@@ -505,6 +523,25 @@ fn main() {
                 ) {
                     eprintln!("daemon error: {e}");
                     std::process::exit(1);
+                }
+                return;
+            }
+            SessionCommand::Log { lines } => {
+                let log = SessionInfo::load(root).and_then(|i| i.server_log);
+                match log {
+                    Some(path) => match tail_lines(&path, *lines) {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => {
+                            eprintln!("Cannot read the server log {path}: {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        eprintln!(
+                            "No server log known for {root}: no daemon is running, or the server does not announce a log file."
+                        );
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }
@@ -1025,6 +1062,25 @@ fn start_daemon(
     }
 }
 
+/// The last `n` lines of the file at `path`, reading only its end.
+fn tail_lines(path: &str, n: usize) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let window = 256 * 1024;
+    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // If we started mid-file, the first line is probably cut off.
+    if len > window && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(n);
+    Ok(lines[start..].iter().map(|l| format!("{l}\n")).collect())
+}
+
 /// Ask the daemon at `socket` for its project import state, waiting a few
 /// seconds at most (it answers between clients, so a busy daemon may not).
 #[cfg(unix)]
@@ -1149,4 +1205,25 @@ fn print_json(resp: &serde_json::Value) {
         "error":  resp.get("error"),
     });
     println!("{}", out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_lines_returns_the_end_of_a_file() {
+        let path = std::env::temp_dir().join(format!("lsp-client-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(tail_lines(p, 2).unwrap(), "three\nfour\n");
+        assert_eq!(tail_lines(p, 10).unwrap(), "one\ntwo\nthree\nfour\n");
+        assert_eq!(tail_lines(p, 0).unwrap(), "");
+        // A file bigger than the read window: the cut-off first line is dropped.
+        let big: String = (0..40_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &big).unwrap();
+        assert_eq!(tail_lines(p, 2).unwrap(), "line 39998\nline 39999\n");
+        let _ = std::fs::remove_file(&path);
+        assert!(tail_lines(p, 1).is_err());
+    }
 }
