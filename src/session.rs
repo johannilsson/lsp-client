@@ -14,6 +14,24 @@ pub enum IdleResult {
     ServerSilent,
 }
 
+/// Answer to `lsp-client/waitIdle`.
+pub struct WaitOutcome {
+    /// The server became idle before the deadline.
+    pub idle: bool,
+    /// Folders whose project import (e.g. kotlin-lsp's Gradle sync) failed:
+    /// queries in them will return little or nothing.
+    pub import_failures: Vec<String>,
+}
+
+impl WaitOutcome {
+    /// Print a warning to stderr if the project import failed.
+    pub fn warn_import_failures(&self) {
+        for f in &self.import_failures {
+            eprintln!("Warning: project import failed for {f}. Results will be incomplete; see the server log (--verbose prints its path).");
+        }
+    }
+}
+
 pub struct LspSession {
     pub transport: Transport,
     next_id: u64,
@@ -241,8 +259,25 @@ impl LspSession {
     /// Send a `lsp-client/waitIdle` request to the daemon and block until it
     /// responds (i.e., until the underlying LSP server is idle).  Only
     /// meaningful in daemon mode; in direct TCP mode prefer `wait_for_index`.
-    pub fn wait_idle_request(&mut self) -> Result<Value> {
-        self.request("lsp-client/waitIdle", json!({}))
+    /// Ask the daemon to block until the server is idle, for at most `max_wait`.
+    pub fn wait_idle_request(&mut self, max_wait: Duration) -> Result<WaitOutcome> {
+        // Leave the socket read timeout a little longer than the daemon's own
+        // deadline so we receive its "timeout" answer rather than an I/O error.
+        self.transport.set_read_timeout(Some(max_wait + Duration::from_secs(10)));
+        let resp = self.request(
+            "lsp-client/waitIdle",
+            json!({"timeoutMs": max_wait.as_millis() as u64}),
+        )?;
+        let result = &resp["result"];
+        // Older daemons answer with a bare string.
+        let status = result["status"].as_str().or_else(|| result.as_str()).unwrap_or("idle");
+        let import_failures = result["importFailures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        Ok(WaitOutcome { idle: status != "timeout", import_failures })
     }
 
     /// Read and discard incoming messages until the server goes quiet and all

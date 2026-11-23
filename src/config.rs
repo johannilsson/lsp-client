@@ -5,6 +5,8 @@ pub struct FileConfig {
     pub server: Option<String>,
     pub language_id: Option<String>,
     pub no_server_stdio_flag: Option<bool>,
+    /// Server profile: `auto` (the default), `generic`, or a name from `servers::KNOWN`.
+    pub server_profile: Option<String>,
     /// Duration string, e.g. "30s", "2m"
     pub timeout: Option<String>,
     pub root: Option<String>,

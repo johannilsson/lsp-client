@@ -1,13 +1,14 @@
 mod config;
 mod daemon;
 mod format;
+mod servers;
 mod session;
 mod session_file;
 mod transport;
 
 use clap::{Parser, Subcommand};
 use format::*;
-use session::{IdleResult, LspSession};
+use session::{IdleResult, LspSession, WaitOutcome};
 use session_file::{unix_timestamp, SessionInfo};
 use transport::Transport;
 
@@ -57,6 +58,11 @@ struct Cli {
     /// Do not pass --stdio to the server process (e.g. sourcekit-lsp uses stdio by default)
     #[arg(long, global = true)]
     no_server_stdio_flag: bool,
+
+    /// Behaviour specific to one server: auto (default: chosen from what the server calls
+    /// itself), generic (none), or kotlin-lsp
+    #[arg(long, global = true, value_name = "NAME")]
+    server_profile: Option<String>,
 
     /// Maximum time to wait for a response (e.g. 10s, 2m). Default: no timeout.
     #[arg(long, global = true, value_parser = parse_duration)]
@@ -253,6 +259,7 @@ struct EffectiveConfig {
     server: Option<String>,
     language_id: Option<String>,
     no_server_stdio_flag: bool,
+    server_profile: Option<String>,
     timeout: Option<std::time::Duration>,
 }
 
@@ -295,6 +302,7 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
         language_id: cli.language_id.clone().or(file_config.language_id),
         no_server_stdio_flag: cli.no_server_stdio_flag
             || file_config.no_server_stdio_flag.unwrap_or(false),
+        server_profile: cli.server_profile.clone().or(file_config.server_profile),
         timeout,
     }
 }
@@ -303,6 +311,12 @@ fn main() {
     let cli = Cli::parse();
     let effective = build_effective_config(&cli);
     let root = &effective.root;
+    if let Some(name) = &effective.server_profile
+        && let Err(e) = servers::select(Some(name), None)
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(2);
+    }
 
     // ---- Session management commands (no LSP session needed) ---------------
 
@@ -322,16 +336,31 @@ fn main() {
                             .language_id
                             .as_deref()
                             .unwrap_or(&info.language_id);
-                        if let Err(e) = wait_for_daemon_ready(
+                        // The daemon keeps running either way; the exit code
+                        // matches `session wait-ready` (2 = timed out,
+                        // 3 = project import failed).
+                        match wait_for_daemon_ready(
                             &info.socket,
                             wait_file.as_deref(),
                             lang,
                             cli.verbose,
                             effective.timeout,
                         ) {
-                            eprintln!("Warning: wait-for-idle failed: {e}");
-                        } else {
-                            eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            Err(e) => {
+                                eprintln!("Warning: wait-for-idle failed: {e}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.idle => {
+                                eprintln!("Warning: server still busy (indexing not finished) for {root}");
+                                std::process::exit(2);
+                            }
+                            Ok(outcome) if !outcome.import_failures.is_empty() => {
+                                outcome.warn_import_failures();
+                                std::process::exit(3);
+                            }
+                            Ok(_) => {
+                                eprintln!("lsp-client daemon ready (indexing complete) for {root}");
+                            }
                         }
                     }
                 return;
@@ -352,6 +381,7 @@ fn main() {
                                     "language_id": info.language_id,
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
+                                    "profile":     info.profile,
                                 })
                             );
                         } else {
@@ -361,6 +391,9 @@ fn main() {
                             println!("server:      {}", info.server);
                             println!("language_id: {}", info.language_id);
                             println!("uptime:      {uptime}");
+                            if !info.profile.is_empty() {
+                                println!("profile:     {}", info.profile);
+                            }
                         }
                     }
                     Some(_) => {
@@ -428,7 +461,13 @@ fn main() {
                     std::process::exit(1);
                 });
                 if let Err(e) = daemon::run_daemon(
-                    root, server, server_args, *idle_timeout, cli.verbose, language_id,
+                    root,
+                    server,
+                    server_args,
+                    *idle_timeout,
+                    cli.verbose,
+                    language_id,
+                    effective.server_profile.as_deref(),
                 ) {
                     eprintln!("daemon error: {e}");
                     std::process::exit(1);
@@ -538,9 +577,15 @@ fn main() {
             &cli.command
         {
             if use_daemon {
-                // Set a generous read timeout so we can wait a long time.
-                session.transport.set_read_timeout(Some(*wait_timeout));
-                session.wait_idle_request()?;
+                let outcome = session.wait_idle_request(*wait_timeout)?;
+                if !outcome.idle {
+                    eprintln!("Timed out waiting for server to become idle.");
+                    std::process::exit(2);
+                }
+                if !outcome.import_failures.is_empty() {
+                    outcome.warn_import_failures();
+                    std::process::exit(3);
+                }
             } else {
                 session.wait_for_index(*wait_timeout);
                 if matches!(session.last_idle_result, Some(IdleResult::TimedOut)) {
@@ -599,8 +644,11 @@ fn main() {
             if cli.wait_for_index && use_daemon {
                 let wait_dur =
                     effective.timeout.unwrap_or(std::time::Duration::from_secs(300));
-                session.transport.set_read_timeout(Some(wait_dur));
-                session.wait_idle_request()?;
+                let outcome = session.wait_idle_request(wait_dur)?;
+                if !outcome.idle && cli.verbose {
+                    eprintln!("[DEBUG] server still busy after {wait_dur:?}; querying anyway");
+                }
+                outcome.warn_import_failures();
                 // Restore the configured timeout for subsequent queries.
                 session.transport.set_read_timeout(effective.timeout);
             }
@@ -848,8 +896,10 @@ fn connect_or_start_daemon(
 }
 
 /// Spawn `lsp-client session daemon-run` as a background process and block
-/// until the session file appears (daemon has finished initialising), or 30 s
-/// elapse.
+/// until the session file appears (daemon has finished initialising), or the
+/// configured `--timeout` (at least 30 s) elapses.  JVM-based servers such as
+/// kotlin-lsp can take longer than 30 s just to answer `initialize` on a large
+/// Gradle/Android workspace.
 fn start_daemon(
     effective: &EffectiveConfig,
     verbose: bool,
@@ -876,6 +926,9 @@ fn start_daemon(
     if effective.no_server_stdio_flag {
         cmd.arg("--no-server-stdio-flag");
     }
+    if let Some(profile) = &effective.server_profile {
+        cmd.arg("--server-profile").arg(profile);
+    }
     if verbose {
         cmd.arg("--verbose");
     }
@@ -888,19 +941,33 @@ fn start_daemon(
     cmd.stdout(Stdio::null());
     cmd.stderr(if verbose { Stdio::inherit() } else { Stdio::null() });
 
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
     // Poll for the session file to appear — this means the daemon has
     // successfully initialised the LSP server and is ready to accept clients.
     let root = &effective.root;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let max_wait = effective
+        .timeout
+        .unwrap_or_default()
+        .max(std::time::Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + max_wait;
     loop {
         if SessionInfo::load(root).map(|i| i.initialized).unwrap_or(false) {
             return Ok(());
         }
+        // A daemon that has exited (typically because the language server failed to
+        // start) will never become ready: say so now rather than after `max_wait`,
+        // which follows `--timeout` and can be minutes.
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "the daemon exited ({status}) before it was ready; the language server probably failed to start (check that '{server}' runs, or use '{} --verbose session start' to see its output)",
+                exe.display()
+            )
+            .into());
+        }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "daemon did not become ready within 30 s (check '{} --verbose session start')",
+                "daemon did not become ready within {max_wait:?} (raise --timeout, or check '{} --verbose session start')",
                 exe.display()
             )
             .into());
@@ -918,19 +985,17 @@ fn wait_for_daemon_ready(
     language_id: &str,
     verbose: bool,
     timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
+    let max_wait = timeout.unwrap_or(std::time::Duration::from_secs(300));
     let transport = Transport::unix_socket(socket)?;
-    if let Some(dur) = timeout.or(Some(std::time::Duration::from_secs(300))) {
-        transport.set_read_timeout(Some(dur));
-    }
+    transport.set_read_timeout(Some(max_wait));
     let mut session = LspSession::new(transport, verbose, timeout);
     // No initialize needed — daemon has the cached result.
     if let Some(f) = wait_file {
         let abs = abs_path(f);
         session.did_open(&abs, language_id)?;
     }
-    session.wait_idle_request()?;
-    Ok(())
+    session.wait_idle_request(max_wait)
 }
 
 #[cfg(not(unix))]
@@ -940,7 +1005,7 @@ fn wait_for_daemon_ready(
     _language_id: &str,
     _verbose: bool,
     _timeout: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
     Err("Unix sockets not available on this platform".into())
 }
 
