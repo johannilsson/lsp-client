@@ -308,6 +308,21 @@ fn handle_connection(
                 // Signal to the main loop that the daemon should shut down.
                 return true;
             }
+            Some("lsp-client/status") => {
+                // Messages the server sent while no client was connected are
+                // still queued; take them into account before answering.
+                while let Ok(queued) = core.server_rx.try_recv() {
+                    core.observe(&queued);
+                }
+                let result = json!({
+                    "import": {
+                        "state": core.facts.import.state(),
+                        "problems": core.facts.import.failures,
+                    },
+                });
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
+                let _ = send_framed(&mut writer, &resp);
+            }
             Some("lsp-client/waitIdle") => {
                 // Block until the server finishes all in-progress work, then
                 // respond so the caller knows it's safe to query.

@@ -86,6 +86,7 @@ fn server_that_never_ends_a_progress_token_is_still_ready() {
     assert!(String::from_utf8_lossy(&hover.stdout).contains("hover from the fake server"));
     assert!(!String::from_utf8_lossy(&hover.stderr).contains("Warning"), "stderr: {}", String::from_utf8_lossy(&hover.stderr));
     let status = ws.run(&["session", "status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("import:      n/a"));
     assert!(String::from_utf8_lossy(&status.stdout).contains("profile:     generic"));
 }
 

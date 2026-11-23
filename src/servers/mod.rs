@@ -36,6 +36,23 @@ pub struct ImportState {
     pub failures: Vec<String>,
 }
 
+impl ImportState {
+    /// For `lsp-client/status`: `"none"` if the server never announced an import
+    /// (most servers), `"running"` while one is in progress, `"problem"` if the last
+    /// one left a folder not imported, otherwise `"ok"`.
+    pub fn state(&self) -> &'static str {
+        if !self.expected {
+            "none"
+        } else if !self.finished {
+            "running"
+        } else if !self.failures.is_empty() {
+            "problem"
+        } else {
+            "ok"
+        }
+    }
+}
+
 /// What a profile can record about the server for the daemon to use.
 #[derive(Default)]
 pub struct ServerFacts {
@@ -132,6 +149,18 @@ mod tests {
     fn an_unknown_profile_is_an_error_that_lists_the_known_ones() {
         let err = select(Some("bogus"), None).err().unwrap();
         assert!(err.contains("bogus") && err.contains("kotlin-lsp") && err.contains("generic"), "{err}");
+    }
+
+    #[test]
+    fn import_state_follows_what_a_profile_records() {
+        let mut st = ImportState::default();
+        assert_eq!(st.state(), "none", "a server that never announces an import");
+        st.expected = true;
+        assert_eq!(st.state(), "running");
+        st.finished = true;
+        assert_eq!(st.state(), "ok");
+        st.failures.push("project not imported for /p/".into());
+        assert_eq!(st.state(), "problem");
     }
 
     #[test]

@@ -32,6 +32,44 @@ impl WaitOutcome {
     }
 }
 
+/// Answer to `lsp-client/status`: what the daemon knows about the project import.
+#[derive(Debug, Default, PartialEq)]
+pub struct DaemonStatus {
+    /// `"none"` (the server doesn't report imports), `"running"`, `"ok"` or `"problem"`.
+    pub import_state: String,
+    /// One message per folder that was not imported, when `import_state` is `"problem"`.
+    pub import_problems: Vec<String>,
+}
+
+impl DaemonStatus {
+    pub fn from_result(result: &Value) -> Self {
+        DaemonStatus {
+            import_state: result["import"]["state"].as_str().unwrap_or("none").to_owned(),
+            import_problems: result["import"]["problems"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
+        }
+    }
+
+    /// Warnings to show next to a query's answer: an empty answer from a
+    /// project that was not imported (or is still being imported) does not
+    /// mean there is nothing to find.
+    pub fn query_warnings(&self) -> Vec<String> {
+        match self.import_state.as_str() {
+            "problem" => self.import_problems.iter().map(|p| format!("Warning: {p}")).collect(),
+            "running" => vec![
+                "Warning: the project import is still running, so results may be incomplete \
+                 (`lsp-client session wait-ready` waits for it)."
+                    .to_owned(),
+            ],
+            _ => Vec::new(),
+        }
+    }
+}
+
 pub struct LspSession {
     pub transport: Transport,
     next_id: u64,
@@ -132,6 +170,16 @@ impl LspSession {
             "params": params,
         });
         self.transport.send_raw(&msg.to_string())
+    }
+
+    /// Ask the daemon for its project import state.  `None` if the daemon does
+    /// not answer (older version, or busy past the read timeout).
+    pub fn daemon_status(&mut self) -> Option<DaemonStatus> {
+        let resp = self.request("lsp-client/status", json!({})).ok()?;
+        if resp.get("error").is_some_and(|e| !e.is_null()) {
+            return None;
+        }
+        Some(DaemonStatus::from_result(&resp["result"]))
     }
 
     /// Options to send as `initializationOptions` in `initialize`.
@@ -504,5 +552,36 @@ impl LspSession {
     pub fn shutdown(mut self) {
         let _ = self.request("shutdown", json!({}));
         let _ = self.notify("exit", json!({}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_is_parsed_from_the_daemon_answer() {
+        let st = DaemonStatus::from_result(&json!({
+            "import": {"state": "problem", "problems": ["project not imported for /p/: no supported build system"]}
+        }));
+        assert_eq!(st.import_state, "problem");
+        assert_eq!(st.import_problems.len(), 1);
+        // An answer without an import section means the server doesn't report one.
+        assert_eq!(DaemonStatus::from_result(&json!({})).import_state, "none");
+    }
+
+    #[test]
+    fn queries_warn_only_when_the_answer_cannot_be_trusted() {
+        let problem = DaemonStatus {
+            import_state: "problem".into(),
+            import_problems: vec!["project not imported for /p/".into()],
+        };
+        assert_eq!(problem.query_warnings(), vec!["Warning: project not imported for /p/".to_string()]);
+        let running = DaemonStatus { import_state: "running".into(), import_problems: vec![] };
+        assert!(running.query_warnings()[0].contains("still running"));
+        for quiet in ["ok", "none"] {
+            let st = DaemonStatus { import_state: quiet.into(), import_problems: vec![] };
+            assert!(st.query_warnings().is_empty(), "{quiet}");
+        }
     }
 }
