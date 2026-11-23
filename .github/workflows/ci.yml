@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --component rust-analyzer --no-self-update
+        run: rustup toolchain install stable --component rust-analyzer --component clippy --no-self-update
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -24,6 +24,17 @@ jobs:
 
       - name: Build
         run: cargo build
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (unit)
+        run: cargo test --bin lsp-client
+
+      # A fake language server (needs python3, which the runner has) checks that how
+      # lsp-client treats servers other than rust-analyzer and kotlin-lsp does not change.
+      - name: Test (other servers)
+        run: cargo test --test generic_server
 
       - name: Test (integration)
         run: cargo test --test integration -- --test-threads=1
