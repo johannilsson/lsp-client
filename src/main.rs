@@ -165,7 +165,13 @@ enum QueryCommand {
         retries: u32,
     },
     /// Get errors and warnings for a file
-    Diagnostics { file: String },
+    Diagnostics {
+        file: String,
+        /// Also show the diagnostics the server profile leaves out (see `servers`;
+        /// for kotlin-lsp: `FunctionName` warnings on @Composable functions)
+        #[arg(long)]
+        all: bool,
+    },
     /// Get completions at a position
     Completion {
         file: String,
@@ -644,6 +650,9 @@ fn main() {
             session.initialize(root)?
         };
 
+        // What to tidy in the answers depends on the server: see `servers`.
+        let profile = output_profile(effective.server_profile.as_deref(), use_daemon, root, &init_resp);
+
         // WaitReady: send lsp-client/waitIdle and exit.
         if let Command::Session { command: SessionCommand::WaitReady { wait_timeout } } =
             &cli.command
@@ -686,7 +695,7 @@ fn main() {
                     | QueryCommand::OutgoingCalls { file, .. }
                     | QueryCommand::References { file, .. }
                     | QueryCommand::Symbols { file }
-                    | QueryCommand::Diagnostics { file }
+                    | QueryCommand::Diagnostics { file, .. }
                     | QueryCommand::Completion { file, .. }
                     | QueryCommand::SignatureHelp { file, .. }
                     | QueryCommand::CodeAction { file, .. }
@@ -730,7 +739,7 @@ fn main() {
                 QueryCommand::Hover { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.hover(&abs, line - 1, col - 1)?;
-                    if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp)) }
+                    if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp, &*profile)) }
                 }
                 QueryCommand::Definition { file, line, col } => {
                     let abs = abs_path(file);
@@ -804,13 +813,18 @@ fn main() {
                     if cli.json {
                         print_json(&resp)
                     } else {
-                        println!("{}", format_workspace_symbols(&resp))
+                        println!("{}", format_workspace_symbols(&resp, &*profile))
                     }
                 }
-                QueryCommand::Diagnostics { file } => {
+                QueryCommand::Diagnostics { file, all } => {
                     let abs = abs_path(file);
                     let resp = session.diagnostics(&abs)?;
-                    if cli.json { print_json(&resp) } else { println!("{}", format_diagnostics(&resp)) }
+                    if cli.json {
+                        print_json(&resp)
+                    } else {
+                        let source = std::fs::read_to_string(&abs).ok();
+                        println!("{}", format_diagnostics(&resp, source.as_deref(), *all, &*profile))
+                    }
                 }
                 QueryCommand::Completion { file, line, col } => {
                     let abs = abs_path(file);
@@ -846,7 +860,15 @@ fn main() {
                     if cli.json {
                         print_json(&resp)
                     } else {
-                        println!("{}", format_semantic_tokens(&resp))
+                        // The token legend is in the server's capabilities.  In daemon
+                        // mode `initialize` was skipped above, so ask the daemon for
+                        // the cached answer.
+                        let caps = if init_resp.is_null() {
+                            session.initialize(root)?["result"]["capabilities"].clone()
+                        } else {
+                            init_resp["result"]["capabilities"].clone()
+                        };
+                        println!("{}", format_semantic_tokens(&resp, &caps))
                     }
                 }
                 QueryCommand::InlayHints { file, start_line, end_line } => {
@@ -879,7 +901,8 @@ fn main() {
                             "diagnostics": diag,
                         }));
                     } else {
-                        print!("{}", format_context(&hover, &def, &refs, &diag));
+                        let source = std::fs::read_to_string(&abs).ok();
+                        print!("{}", format_context(&hover, &def, &refs, &diag, source.as_deref(), &*profile));
                     }
                 }
             },
@@ -1060,6 +1083,25 @@ fn start_daemon(
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// The server profile for tidying answers. With a daemon it is the one the daemon runs
+/// with (stored in the session file); without one, it is chosen from the server's own
+/// `initialize` answer, as the daemon does.
+fn output_profile(
+    requested: Option<&str>,
+    use_daemon: bool,
+    root: &str,
+    init_resp: &serde_json::Value,
+) -> Box<dyn servers::ServerProfile> {
+    if use_daemon
+        && let Some(info) = SessionInfo::load(root)
+        && let Some(profile) = servers::by_name(&info.profile)
+    {
+        return profile;
+    }
+    let server_name = init_resp["result"]["serverInfo"]["name"].as_str();
+    servers::select(requested, server_name).unwrap_or_else(|_| servers::generic())
 }
 
 /// The last `n` lines of the file at `path`, reading only its end.

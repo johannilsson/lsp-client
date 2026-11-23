@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use crate::servers::ServerProfile;
 
 fn uri_to_path(uri: &str) -> &str {
     uri.strip_prefix("file://").unwrap_or(uri)
@@ -126,7 +127,30 @@ pub fn format_capabilities(caps: &Value) -> String {
     if lines.is_empty() { "No capabilities reported.".into() } else { lines.join("\n") }
 }
 
-pub fn format_hover(resp: &Value) -> String {
+/// Turn markdown links whose target is an editor `command:` URI into their text:
+/// they run a command in an editor, and no command line caller can follow them.
+fn strip_command_links(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(i) = rest.find("](command:") {
+        let (Some(open), Some(close)) = (rest[..i].rfind('['), rest[i..].find(')').map(|j| i + j)) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..i]);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Hover text. The profile may tidy it first; whatever editor `command:` links are
+/// left become plain text.
+pub fn format_hover(resp: &Value, profile: &dyn ServerProfile) -> String {
+    strip_command_links(&profile.rewrite_hover(format_hover_raw(resp)))
+}
+
+fn format_hover_raw(resp: &Value) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No hover information found.".into();
     };
@@ -282,7 +306,8 @@ fn walk_symbols(symbols: &[Value], indent: usize, lines: &mut Vec<String>) {
     }
 }
 
-pub fn format_workspace_symbols(resp: &Value) -> String {
+/// Workspace symbols, each declaration once, and only those the profile wants shown.
+pub fn format_workspace_symbols(resp: &Value, profile: &dyn ServerProfile) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No symbols found.".into();
     };
@@ -292,7 +317,12 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
     if arr.is_empty() {
         return "No symbols found.".into();
     }
+    // A server can list the same declaration more than once, e.g. once per source set
+    // that contains it. Show each (name, kind, location) once.
+    let mut seen = std::collections::HashSet::new();
     arr.iter()
+        .filter(|s| profile.keep_workspace_symbol(s))
+        .filter(|s| seen.insert((s["name"].to_string(), s["kind"].to_string(), s["location"].to_string())))
         .map(|s| {
             let kind = symbol_kind(s["kind"].as_u64().unwrap_or(0));
             let name = s["name"].as_str().unwrap_or("?");
@@ -305,7 +335,13 @@ pub fn format_workspace_symbols(resp: &Value) -> String {
         .join("\n")
 }
 
-pub fn format_diagnostics(resp: &Value) -> String {
+/// Diagnostics as text.
+///
+/// `source` is the text of the file, for profiles that need it to decide what to
+/// show. The profile may leave diagnostics out (kotlin-lsp: `FunctionName` warnings
+/// on `@Composable` functions, which Compose names in UpperCase on purpose);
+/// `show_all` shows everything the server reported.
+pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool, profile: &dyn ServerProfile) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No diagnostics.".into();
     };
@@ -316,6 +352,7 @@ pub fn format_diagnostics(resp: &Value) -> String {
     } else {
         return "No diagnostics.".into();
     };
+    let items: Vec<&Value> = items.iter().filter(|d| show_all || profile.keep_diagnostic(d, source)).collect();
     if items.is_empty() {
         return "No diagnostics.".into();
     }
@@ -440,7 +477,9 @@ pub fn format_rename(resp: &Value) -> String {
     if lines.is_empty() { "No changes.".into() } else { lines.join("\n") }
 }
 
-// Semantic token types in the order kotlin-lsp declares them
+// Fallback legend, used only when the server's initialize response carries
+// none (the order kotlin-lsp 262.x declared).  The server's own legend from
+// `semanticTokensProvider.legend` takes precedence.
 const TOKEN_TYPES: &[&str] = &[
     "namespace", "class", "enum", "interface", "struct", "typeParameter",
     "type", "parameter", "variable", "property", "enumMember", "event",
@@ -452,7 +491,17 @@ const TOKEN_MODIFIERS: &[&str] = &[
     "abstract", "async", "modification", "documentation", "defaultLibrary",
 ];
 
-pub fn format_semantic_tokens(resp: &Value) -> String {
+pub fn format_semantic_tokens(resp: &Value, caps: &Value) -> String {
+    let legend = &caps["semanticTokensProvider"]["legend"];
+    let from_legend = |key: &str, fallback: &[&str]| -> Vec<String> {
+        match legend[key].as_array() {
+            Some(a) => a.iter().map(|v| v.as_str().unwrap_or("unknown").to_string()).collect(),
+            None => fallback.iter().map(|s| s.to_string()).collect(),
+        }
+    };
+    let token_types = from_legend("tokenTypes", TOKEN_TYPES);
+    let token_modifiers = from_legend("tokenModifiers", TOKEN_MODIFIERS);
+
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No semantic tokens.".into();
     };
@@ -478,10 +527,10 @@ pub fn format_semantic_tokens(resp: &Value) -> String {
         cur_line += delta_line;
         cur_start = if delta_line > 0 { delta_start } else { cur_start + delta_start };
 
-        let type_name = TOKEN_TYPES.get(token_type).copied().unwrap_or("unknown");
-        let mods: Vec<&str> = (0..TOKEN_MODIFIERS.len())
+        let type_name = token_types.get(token_type).map_or("unknown", |s| s.as_str());
+        let mods: Vec<&str> = (0..token_modifiers.len().min(64))
             .filter(|&i| token_mods & (1 << i) != 0)
-            .map(|i| TOKEN_MODIFIERS[i])
+            .map(|i| token_modifiers[i].as_str())
             .collect();
         let mods_str = if mods.is_empty() { String::new() } else { format!(" ({})", mods.join(", ")) };
         lines.push(format!(
@@ -530,13 +579,20 @@ fn completion_kind(kind: u64) -> &'static str {
     }
 }
 
-pub fn format_context(hover: &Value, definition: &Value, references: &Value, diagnostics: &Value) -> String {
+pub fn format_context(
+    hover: &Value,
+    definition: &Value,
+    references: &Value,
+    diagnostics: &Value,
+    source: Option<&str>,
+    profile: &dyn ServerProfile,
+) -> String {
     let mut out = String::new();
 
     // Hover
     let hover_text = match hover.get("result").filter(|v| !v.is_null()) {
         Some(_) => {
-            let s = format_hover(hover);
+            let s = format_hover(hover, profile);
             if s == "No hover information found." { None } else { Some(s) }
         }
         None => None,
@@ -582,7 +638,7 @@ pub fn format_context(hover: &Value, definition: &Value, references: &Value, dia
     // Diagnostics
     let diag_text = match diagnostics.get("result").filter(|v| !v.is_null()) {
         Some(_) => {
-            let s = format_diagnostics(diagnostics);
+            let s = format_diagnostics(diagnostics, source, false, profile);
             if s == "No diagnostics." { None } else { Some(s) }
         }
         None => None,
@@ -631,4 +687,81 @@ pub fn format_completion(resp: &Value) -> String {
         lines.push(format!("... and {} more", items.len() - 30));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::servers;
+    use serde_json::json;
+
+    #[test]
+    fn command_links_become_their_text_and_normal_links_stay() {
+        let md = "[run](command:foo?x) and [docs](https://example.com)";
+        assert_eq!(strip_command_links(md), "run and [docs](https://example.com)");
+        // Not a link at all, or an unfinished one: left as it is.
+        assert_eq!(strip_command_links("a ](command:x"), "a ](command:x");
+    }
+
+    fn hover(md: &str) -> Value {
+        json!({"result": {"contents": {"kind": "markdown", "value": md}}})
+    }
+
+    #[test]
+    fn hover_links_follow_the_profile_then_the_generic_clean_up() {
+        let md = "From [`a.B`](command:jetbrains.navigateToLocation?%5B%22file%3A%2F%2F%2Fx%2FB.java%22%2C5%2C19%5D), [run](command:foo)";
+        // kotlin-lsp: its place links become a place; the other link becomes its text.
+        let kotlin = servers::by_name("kotlin-lsp").unwrap();
+        assert_eq!(format_hover(&hover(md), &*kotlin), "From `a.B` (/x/B.java:6:20), run");
+        // Another server: every command link is just its text.
+        assert_eq!(format_hover(&hover(md), &*servers::generic()), "From `a.B`, run");
+    }
+
+    fn symbol(uri: &str) -> Value {
+        json!({"name": "f", "kind": 12, "containerName": "p",
+            "location": {"uri": uri, "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 5}}}})
+    }
+
+    #[test]
+    fn workspace_symbols_are_shown_once_and_the_profile_can_drop_some() {
+        let own_jar = "jar:///p/app/build/intermediates/x/classes.jar!/AKt.class";
+        let resp = json!({"result": [symbol("file:///a.kt"), symbol("file:///a.kt"), symbol(own_jar)]});
+        // Identical entries collapse; a profile that doesn't know the jar keeps it.
+        assert_eq!(format_workspace_symbols(&resp, &*servers::generic()).lines().count(), 2);
+        // kotlin-lsp's profile drops the project's own compiled jar.
+        let out = format_workspace_symbols(&resp, &*servers::by_name("kotlin-lsp").unwrap());
+        assert_eq!(out.lines().count(), 1, "{out}");
+    }
+
+    fn function_name_warning() -> Value {
+        json!({"code": "FunctionName", "severity": 2,
+               "message": "Function name 'Foo' should start with a lowercase letter",
+               "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}})
+    }
+
+    fn diagnostics(items: Vec<Value>) -> Value {
+        json!({"result": {"items": items}})
+    }
+
+    #[test]
+    fn diagnostics_go_through_the_profile_and_all_shows_everything() {
+        let src = "@Composable\nfun Foo() {}\n";
+        let resp = diagnostics(vec![function_name_warning()]);
+        let kotlin = servers::by_name("kotlin-lsp").unwrap();
+        assert_eq!(format_diagnostics(&resp, Some(src), false, &*kotlin), "No diagnostics.");
+        assert!(format_diagnostics(&resp, Some(src), true, &*kotlin).contains("Foo"));
+        // Another server's diagnostics are shown whatever the source says.
+        assert!(format_diagnostics(&resp, Some(src), false, &*servers::generic()).contains("Foo"));
+    }
+
+    #[test]
+    fn a_kept_diagnostic_next_to_a_hidden_one_is_still_listed() {
+        let src = "@Composable\nfun Foo() {}\n";
+        let other = json!({"code": "SomethingElse", "severity": 2, "message": "unused",
+                           "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}});
+        let resp = diagnostics(vec![function_name_warning(), other]);
+        let out = format_diagnostics(&resp, Some(src), false, &*servers::by_name("kotlin-lsp").unwrap());
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("unused"));
+    }
 }
