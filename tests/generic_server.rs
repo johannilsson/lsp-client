@@ -229,6 +229,35 @@ fn an_unknown_profile_name_stops_tcp_mode_too() {
 
 
 #[test]
+fn a_daemon_from_another_build_of_the_same_version_is_reported() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("other-build");
+    let out = ws.start_fake(&[], &[]);
+    assert!(out.status.success(), "start failed: {}", stderr(&out));
+
+    // The binary that started the daemon sees no mismatch.
+    let same = ws.run(&["session", "status"]);
+    assert!(!stderr(&same).contains("different build"), "{}", stderr(&same));
+
+    // A copy has the same version but a newer modification time, as after a rebuild.
+    let copy = std::env::temp_dir().join(format!("lsp-client-copy-{}", std::process::id()));
+    std::fs::copy(BINARY, &copy).unwrap();
+    let other = Command::new(&copy)
+        .args(["--root", ws.0.to_str().unwrap(), "session", "status"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&copy);
+    assert!(
+        stderr(&other).contains("different build of lsp-client") && stderr(&other).contains("session stop"),
+        "{}",
+        stderr(&other)
+    );
+}
+
+#[test]
 fn positions_can_be_given_as_file_line_col_or_with_symbol() {
     if !python3_available() {
         eprintln!("skipped: python3 not available");

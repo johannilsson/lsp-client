@@ -17,6 +17,26 @@ pub struct SessionInfo {
     /// Name of the server profile in use (see `servers`); empty in session files
     /// written before profiles existed.
     pub profile: String,
+    /// lsp-client version that started the daemon; empty in session files
+    /// written before this field existed.
+    pub version: String,
+    /// Identifies the build of the binary that started the daemon (see
+    /// [`build_id`]); empty in session files written before this field existed.
+    pub build: String,
+}
+
+/// Identifies this build of lsp-client: the modification time of the running
+/// executable. The version number stays the same across rebuilds and
+/// `cargo install` from a newer checkout; the executable's time does not.
+/// Empty if it cannot be read.
+pub fn build_id() -> String {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_default()
 }
 
 /// Stable, deterministic hash of a workspace path used as the session filename.
@@ -58,6 +78,8 @@ impl SessionInfo {
             initialized: v["initialized"].as_bool().unwrap_or(false),
             server_log: v["server_log"].as_str().map(str::to_owned),
             profile: v["profile"].as_str().unwrap_or("").to_owned(),
+            version: v["version"].as_str().unwrap_or("").to_owned(),
+            build: v["build"].as_str().unwrap_or("").to_owned(),
         })
     }
 
@@ -76,12 +98,36 @@ impl SessionInfo {
             "initialized": self.initialized,
             "server_log":  self.server_log,
             "profile":     self.profile,
+            "version":     self.version,
+            "build":       self.build,
         });
         std::fs::write(path, v.to_string())
     }
 
     pub fn delete(workspace: &str) {
         let _ = std::fs::remove_file(session_path(workspace));
+    }
+
+    /// A warning if the daemon was started by a different lsp-client build than
+    /// this one: it may not understand newer requests, and would answer them
+    /// with an error that is easy to miss.
+    pub fn version_mismatch_warning(&self) -> Option<String> {
+        self.mismatch_warning(env!("CARGO_PKG_VERSION"), &build_id())
+    }
+
+    fn mismatch_warning(&self, ours: &str, our_build: &str) -> Option<String> {
+        let fix = "run `lsp-client session stop` so the next command starts a matching one.";
+        if self.version != ours {
+            let theirs = if self.version.is_empty() { "an older version" } else { &self.version };
+            return Some(format!("Warning: the daemon was started by lsp-client {theirs}, this is {ours}: {fix}"));
+        }
+        // Same version number: compare builds, unless either side cannot tell.
+        if !self.build.is_empty() && !our_build.is_empty() && self.build != our_build {
+            return Some(format!(
+                "Warning: the daemon was started by a different build of lsp-client {ours}: {fix}"
+            ));
+        }
+        None
     }
 
     /// Returns true if the daemon process is still running.
@@ -102,4 +148,56 @@ pub fn unix_timestamp() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(version: &str) -> SessionInfo {
+        SessionInfo {
+            workspace: "/w".into(),
+            server: "s".into(),
+            language_id: "x".into(),
+            pid: 1,
+            socket: "/s".into(),
+            started_at: 0,
+            initialized: true,
+            server_log: None,
+            profile: String::new(),
+            version: version.into(),
+            build: "100.000000000".into(),
+        }
+    }
+
+    #[test]
+    fn same_version_and_build_does_not_warn() {
+        assert!(info("1.0.0").mismatch_warning("1.0.0", "100.000000000").is_none());
+    }
+
+    #[test]
+    fn other_or_missing_version_warns() {
+        let w = info("0.0.1").mismatch_warning("1.0.0", "100.000000000").unwrap();
+        assert!(w.contains("0.0.1") && w.contains("this is 1.0.0") && w.contains("session stop"));
+        assert!(info("").mismatch_warning("1.0.0", "100.000000000").unwrap().contains("an older version"));
+    }
+
+    #[test]
+    fn same_version_from_another_build_warns() {
+        let w = info("1.0.0").mismatch_warning("1.0.0", "200.000000000").unwrap();
+        assert!(w.contains("different build of lsp-client 1.0.0"), "{w}");
+    }
+
+    #[test]
+    fn an_unknown_build_on_either_side_does_not_warn() {
+        assert!(info("1.0.0").mismatch_warning("1.0.0", "").is_none());
+        let mut old = info("1.0.0");
+        old.build.clear();
+        assert!(old.mismatch_warning("1.0.0", "200.000000000").is_none());
+    }
+
+    #[test]
+    fn this_build_has_an_id() {
+        assert!(!build_id().is_empty());
+    }
 }

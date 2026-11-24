@@ -484,6 +484,8 @@ fn main() {
                                         "problems": d.import_problems,
                                     })),
                                     "profile":     info.profile,
+                                    "version":     info.version,
+                                    "build":       info.build,
                                 })
                             );
                         } else {
@@ -495,6 +497,13 @@ fn main() {
                             println!("uptime:      {uptime}");
                             if !info.profile.is_empty() {
                                 println!("profile:     {}", info.profile);
+                            }
+                            println!(
+                                "version:     {}",
+                                if info.version.is_empty() { "unknown (older than this feature)" } else { &info.version }
+                            );
+                            if let Some(w) = info.version_mismatch_warning() {
+                                eprintln!("{w}");
                             }
                             if let Some(log) = &info.server_log {
                                 println!("server log:  {log}");
@@ -646,6 +655,13 @@ fn main() {
             || cli.stdio
             || session_info.as_ref().map(|i| i.is_alive()).unwrap_or(false)
             || effective.server.is_some());
+
+    if use_daemon
+        && let Some(info) = session_info.as_ref().filter(|i| i.is_alive())
+        && let Some(warning) = info.version_mismatch_warning()
+    {
+        eprintln!("{warning}");
+    }
 
     let transport = if use_daemon {
         connect_or_start_daemon(&effective, cli.verbose, 300)
