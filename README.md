@@ -221,13 +221,13 @@ The integration tests run against a small fixture Rust project using rust-analyz
 rustup component add rust-analyzer
 ```
 
-Then run the tests serially (the daemon handles one connection at a time):
+Then run the tests:
 
 ```sh
-cargo test --test integration -- --test-threads=1
+cargo test --test integration
 ```
 
-The first run starts a daemon for the fixture project and warms it up; subsequent runs reuse it. The daemon shuts itself down after 5 minutes of inactivity.
+Each run stops any daemon left for the fixture project, starts a fresh one and warms it up; the tests share it, in parallel. The daemon shuts itself down after 5 minutes of inactivity.
 
 `tests/kotlin_lsp.rs` tests kotlin-lsp's project import handling (a folder without a build file, a folder with both Gradle and Maven files, and `--build-tool`) on tiny projects it creates in a temp directory. It needs `kotlin-lsp` on `PATH` and network access for Gradle, and is skipped with a note when kotlin-lsp is missing:
 

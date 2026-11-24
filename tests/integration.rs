@@ -1,10 +1,10 @@
 // Integration tests for lsp-client using rust-analyzer on a small fixture project.
 //
 // Run with:
-//   cargo test --test integration -- --test-threads=1
+//   cargo test --test integration
 //
-// The daemon is started once and reused across tests. Running with more than
-// one thread risks contention on the daemon's single-connection accept loop.
+// One daemon is started per test run and shared by the tests, which may run
+// in parallel: the daemon serves each connection on its own thread.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

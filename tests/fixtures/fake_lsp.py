@@ -11,10 +11,14 @@ Environment variables change what it does:
   `window/logMessage` sent before the `initialize` answer, as kotlin-lsp does.
 - FAKE_LSP_INTELLIJ=1: also send kotlin-lsp's `intellij/workspaceImport*`
   notifications, reporting a failed import, as kotlin-lsp would.
+- FAKE_LSP_HOVER_DELAY: wait this many seconds before answering a hover, to
+  stand for a slow query. The answer names the hovered line, so that parallel
+  callers can each check they got their own.
 """
 import json
 import os
 import sys
+import time
 
 
 def read():
@@ -58,7 +62,10 @@ while True:
         send({"jsonrpc": "2.0", "id": 900, "method": "window/workDoneProgress/create", "params": {"token": "t1"}})
         send({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": "t1", "value": {"kind": "begin", "title": "Indexing"}}})
     elif method == "textDocument/hover":
-        send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown", "value": "hover from the fake server"}}})
+        time.sleep(float(os.environ.get("FAKE_LSP_HOVER_DELAY", "0")))
+        line = m["params"]["position"]["line"] + 1
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown",
+              "value": "hover from the fake server at line %d" % line}}})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": m["id"], "result": None})
     elif method == "exit":

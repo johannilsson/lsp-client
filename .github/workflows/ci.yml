@@ -37,4 +37,4 @@ jobs:
         run: cargo test --test generic_server
 
       - name: Test (integration)
-        run: cargo test --test integration -- --test-threads=1
+        run: cargo test --test integration
