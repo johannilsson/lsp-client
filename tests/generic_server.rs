@@ -342,3 +342,51 @@ fn parallel_queries_each_get_their_own_answer() {
         assert!(stdout.contains(&format!("at line {line}\n")) || stdout.trim_end().ends_with(&format!("at line {line}")), "hover {line} got: {stdout}");
     }
 }
+
+#[test]
+fn a_server_that_fails_at_startup_leaves_its_error_readable() {
+    let ws = Workspace::new("startup-error");
+    let script = ws.0.join("broken-server.sh");
+    std::fs::write(&script, "#!/bin/sh\necho 'broken-server: no JDK found' >&2\nexit 1\n").unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&script).status().unwrap();
+
+    let out = ws.run(&[
+        "--timeout", "60s", "--server", script.to_str().unwrap(), "--no-server-stdio-flag",
+        "--language-id", "plain", "session", "start", "--wait",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("broken-server: no JDK found"), "start: {}", stderr(&out));
+
+    // Still there once the daemon is gone.
+    let log = ws.run(&["session", "log"]);
+    assert!(String::from_utf8_lossy(&log.stdout).contains("broken-server: no JDK found"), "log: {}", stderr(&log));
+}
+
+#[test]
+fn a_running_server_s_stderr_is_shown_and_removed_on_stop() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("stderr-file");
+    let out = ws.start_fake(&[], &[("FAKE_LSP_STDERR", "fake server says hello on stderr")]);
+    assert!(out.status.success(), "start failed: {}", stderr(&out));
+
+    let status = status_stdout(&ws);
+    let path = status
+        .lines()
+        .find_map(|l| l.strip_prefix("stderr:"))
+        .map(|p| p.trim().to_owned())
+        .unwrap_or_else(|| panic!("no stderr: line in\n{status}"));
+    let log = ws.run(&["session", "log"]);
+    assert!(String::from_utf8_lossy(&log.stdout).contains("fake server says hello on stderr"), "log: {}", stderr(&log));
+
+    let stop = ws.run(&["session", "stop"]);
+    assert!(stop.status.success(), "{}", stderr(&stop));
+    // The daemon removes the file just after the session file; give it a moment.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&path).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!Path::new(&path).exists(), "{path} was left after session stop");
+}

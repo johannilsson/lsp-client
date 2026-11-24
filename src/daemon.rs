@@ -26,7 +26,7 @@ use crate::session_file::{unix_timestamp, SessionInfo};
 use crate::transport::MessageReader;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -500,6 +500,40 @@ fn rewrite_repeat_open(core: &mut DaemonCore, msg: Value) -> Value {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Most of the server's stderr kept on disk; older output is dropped.
+const STDERR_CAP: u64 = 1024 * 1024;
+
+/// Copy the server's stderr into `path`, keeping at most about `cap` bytes of
+/// the most recent output: when the file would grow past it, it starts over
+/// with a note that earlier output was dropped.  Keeps reading even if the file
+/// cannot be written, so a full pipe never blocks the server.
+fn copy_capped(mut from: impl Read, path: &std::path::Path, cap: u64) {
+    const DROPPED: &[u8] = b"[lsp-client: earlier output dropped]\n";
+    let mut file = std::fs::File::create(path).ok();
+    let mut written: u64 = 0;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let Some(f) = file.as_mut() else { continue };
+        if written + n as u64 > cap {
+            let restarted = f.set_len(0).and_then(|_| f.seek(SeekFrom::Start(0))).and_then(|_| f.write_all(DROPPED));
+            if restarted.is_err() {
+                file = None;
+                continue;
+            }
+            written = DROPPED.len() as u64;
+        }
+        if f.write_all(&buf[..n]).is_err() {
+            file = None;
+            continue;
+        }
+        written += n as u64;
+    }
+}
+
 /// Settings that only matter to the daemon process.
 #[derive(Default)]
 pub struct DaemonOptions {
@@ -524,11 +558,24 @@ pub fn run_daemon(
 ) -> Result<()> {
     // ---- Spawn the LSP server child process ---------------------------------
 
+    let canonical_root = std::fs::canonicalize(workspace)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| workspace.to_owned());
+
+    // With --verbose the server's stderr goes to the terminal, as before.
+    // Otherwise it goes to a file next to the session file, so a startup error
+    // or a crash message is not lost (`session log`, and `session start` when
+    // the server fails).
+    let stderr_file = (!verbose).then(|| crate::session_file::stderr_path(&canonical_root));
+    if let Some(parent) = stderr_file.as_ref().and_then(|p| p.parent()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     let mut child: Child = Command::new(server_bin)
         .args(server_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(if stderr_file.is_some() { Stdio::piped() } else { Stdio::inherit() })
         .spawn()
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
@@ -537,6 +584,10 @@ pub fn run_daemon(
                 format!("failed to spawn {server_bin}: {e}")
             }
         })?;
+
+    if let (Some(path), Some(server_stderr)) = (stderr_file.clone(), child.stderr.take()) {
+        std::thread::spawn(move || copy_capped(server_stderr, &path, STDERR_CAP));
+    }
 
     let server_stdin = child.stdin.take().unwrap();
     let server_stdout = child.stdout.take().unwrap();
@@ -569,9 +620,6 @@ pub fn run_daemon(
 
     // ---- LSP initialisation -------------------------------------------------
 
-    let canonical_root = std::fs::canonicalize(workspace)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| workspace.to_owned());
     let root_uri = format!("file://{canonical_root}");
     let basename = std::path::Path::new(&canonical_root)
         .file_name()
@@ -664,6 +712,7 @@ pub fn run_daemon(
         started_at: unix_timestamp(),
         initialized: true,
         server_log: core.facts.server_log.clone(),
+        server_stderr: stderr_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
         profile: core.profile.name().to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         build: crate::session_file::build_id(),
@@ -759,6 +808,14 @@ pub fn run_daemon(
     let _ = child.kill();
     let _ = child.wait();
 
+    // The server's stderr is kept only if the server died: then its last words
+    // are what `session log` should show.
+    if !shared.server_dead.load(Ordering::SeqCst)
+        && let Some(path) = &stderr_file
+    {
+        let _ = std::fs::remove_file(path);
+    }
+
     eprintln!("[DAEMON] stopped");
     Ok(())
 }
@@ -819,6 +876,25 @@ mod tests {
         for method in ["window/workDoneProgress/create", "client/registerCapability", "window/showMessageRequest"] {
             assert_eq!(server_request_result(method, &json!({})), Value::Null, "{method}");
         }
+    }
+
+    #[test]
+    fn the_server_stderr_file_keeps_the_latest_output_within_the_cap() {
+        let dir = std::env::temp_dir().join(format!("lsp-client-stderr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.stderr");
+
+        copy_capped(&b"started\n"[..], &path, 1024);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "started\n");
+
+        // 3000 bytes through a 1000-byte cap: the file stays small and ends with the latest.
+        let noisy: Vec<u8> = (0..300).flat_map(|i| format!("line {i:04}\n").into_bytes()).collect();
+        copy_capped(&noisy[..], &path, 1000);
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.len() <= 1000 + 8192, "{}", kept.len());
+        assert!(kept.starts_with("[lsp-client: earlier output dropped]"), "{kept}");
+        assert!(kept.ends_with("line 0299\n"), "{kept}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
