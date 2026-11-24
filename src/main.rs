@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod format;
+mod position;
 mod servers;
 mod session;
 mod session_file;
@@ -104,6 +105,26 @@ enum Command {
     },
     /// List capabilities reported by the server
     Capabilities,
+}
+
+/// True when a response carries no result (null, or an empty list).
+fn result_is_empty(resp: &serde_json::Value) -> bool {
+    match resp.get("result") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        _ => false,
+    }
+}
+
+/// After an empty answer to a position query, say on stderr what is at the
+/// position (the answer itself and `--json` output stay as they are).
+fn explain_empty(json: bool, resp: &serde_json::Value, file: &str, line: u32, col: u32) {
+    if json || !result_is_empty(resp) {
+        return;
+    }
+    if let Ok(text) = std::fs::read_to_string(file) {
+        eprintln!("Note: {}", position::describe(&text, line, col));
+    }
 }
 
 #[derive(Subcommand)]
@@ -748,21 +769,25 @@ fn main() {
                     let abs = abs_path(file);
                     let resp = session.hover(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp, &*profile)) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::Definition { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.definition(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_definition(&resp)) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::Implementation { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.implementation(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_locations(&resp, "No implementations found.")) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::TypeDefinition { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.type_definition(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_locations(&resp, "No type definition found.")) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::IncomingCalls { file, line, col } => {
                     let abs = abs_path(file);
