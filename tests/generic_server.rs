@@ -256,3 +256,31 @@ fn a_daemon_from_another_build_of_the_same_version_is_reported() {
         stderr(&other)
     );
 }
+
+#[test]
+fn positions_can_be_given_as_file_line_col_or_with_symbol() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("position-forms");
+    std::fs::write(ws.0.join("a.txt"), "hello hello\n").unwrap();
+    let out = ws.start_fake(&[], &[]);
+    assert!(out.status.success(), "start failed: {}", stderr(&out));
+    let file = ws.0.join("a.txt");
+    let file = file.to_str().unwrap();
+
+    let joined = ws.run(&["query", "hover", &format!("{file}:1:1")]);
+    assert!(joined.status.success(), "{}", stderr(&joined));
+    assert!(String::from_utf8_lossy(&joined.stdout).contains("hover from the fake server"));
+
+    // The name is on the line twice: the first is used, and the note says so.
+    let by_name = ws.run(&["query", "hover", &format!("{file}:1"), "--symbol", "hello"]);
+    assert!(by_name.status.success(), "{}", stderr(&by_name));
+    assert!(String::from_utf8_lossy(&by_name.stdout).contains("hover from the fake server"));
+    assert!(stderr(&by_name).contains("2 times; using the first, at 1:1"), "{}", stderr(&by_name));
+
+    let missing = ws.run(&["query", "hover", file, "1", "--symbol", "nope"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(stderr(&missing).contains("`nope` is not on line 1"), "{}", stderr(&missing));
+}

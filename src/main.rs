@@ -1,6 +1,8 @@
 mod config;
 mod daemon;
 mod format;
+mod position;
+mod position_args;
 mod servers;
 mod session;
 mod session_file;
@@ -86,8 +88,56 @@ struct Cli {
     #[arg(long, global = true)]
     wait_for_index: bool,
 
+    /// For a position query: find this name on the given line instead of giving a
+    /// column (`query hover src/a.rs 12 --symbol total`; the first occurrence is used)
+    #[arg(long, global = true, value_name = "NAME")]
+    symbol: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Options that take a separate value (`--root DIR`), in every subcommand.
+fn value_flags(cmd: &clap::Command, out: &mut std::collections::HashSet<String>) {
+    for arg in cmd.get_arguments() {
+        if arg.get_action().takes_values() && !arg.is_positional() {
+            if let Some(long) = arg.get_long() {
+                out.insert(format!("--{long}"));
+            }
+            if let Some(short) = arg.get_short() {
+                out.insert(format!("-{short}"));
+            }
+        }
+    }
+    for sub in cmd.get_subcommands() {
+        value_flags(sub, out);
+    }
+}
+
+/// Parse the command line, after turning `file:line:col` and `--symbol` into
+/// plain `<file> <line> <col>` arguments (see `position_args`).
+fn parse_cli() -> Cli {
+    use clap::{CommandFactory, Parser as _};
+    let mut flags = std::collections::HashSet::new();
+    value_flags(&Cli::command(), &mut flags);
+    let expanded = position_args::expand(
+        std::env::args().collect(),
+        &flags,
+        &|path| std::fs::read_to_string(path).ok(),
+        &|path| std::path::Path::new(path).exists(),
+    );
+    match expanded {
+        Ok(e) => {
+            if let Some(note) = e.note {
+                eprintln!("{note}");
+            }
+            Cli::parse_from(e.args)
+        }
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            std::process::exit(2);
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -104,6 +154,26 @@ enum Command {
     },
     /// List capabilities reported by the server
     Capabilities,
+}
+
+/// True when a response carries no result (null, or an empty list).
+fn result_is_empty(resp: &serde_json::Value) -> bool {
+    match resp.get("result") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        _ => false,
+    }
+}
+
+/// After an empty answer to a position query, say on stderr what is at the
+/// position (the answer itself and `--json` output stay as they are).
+fn explain_empty(json: bool, resp: &serde_json::Value, file: &str, line: u32, col: u32) {
+    if json || !result_is_empty(resp) {
+        return;
+    }
+    if let Ok(text) = std::fs::read_to_string(file) {
+        eprintln!("Note: {}", position::describe(&text, line, col));
+    }
 }
 
 #[derive(Subcommand)]
@@ -334,7 +404,7 @@ fn build_effective_config(cli: &Cli) -> EffectiveConfig {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let effective = build_effective_config(&cli);
     let root = &effective.root;
     if let Some(name) = &effective.server_profile
@@ -764,21 +834,25 @@ fn main() {
                     let abs = abs_path(file);
                     let resp = session.hover(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_hover(&resp, &*profile)) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::Definition { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.definition(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_definition(&resp)) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::Implementation { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.implementation(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_locations(&resp, "No implementations found.")) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::TypeDefinition { file, line, col } => {
                     let abs = abs_path(file);
                     let resp = session.type_definition(&abs, line - 1, col - 1)?;
                     if cli.json { print_json(&resp) } else { println!("{}", format_locations(&resp, "No type definition found.")) }
+                    explain_empty(cli.json, &resp, &abs, *line, *col);
                 }
                 QueryCommand::IncomingCalls { file, line, col } => {
                     let abs = abs_path(file);
