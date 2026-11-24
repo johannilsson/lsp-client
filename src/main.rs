@@ -415,6 +415,7 @@ fn main() {
                                     })),
                                     "profile":     info.profile,
                                     "version":     info.version,
+                                    "build":       info.build,
                                 })
                             );
                         } else {

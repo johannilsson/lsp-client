@@ -44,22 +44,18 @@ static DAEMON_READY: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     DAEMON_READY.get_or_init(|| {
-        let running = lsp_cmd()
-            .args(["session", "status"])
+        // Always start a fresh daemon: one left over from an earlier run may be
+        // from an older build, and would answer with that build's behaviour.
+        let _ = lsp_cmd().args(["session", "stop"]).output();
+        let out = lsp_cmd()
+            .args(["session", "start", "--wait"])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !running {
-            let out = lsp_cmd()
-                .args(["session", "start", "--wait"])
-                .output()
-                .expect("failed to run session start");
-            assert!(
-                out.status.success(),
-                "daemon failed to start:\n{}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
+            .expect("failed to run session start");
+        assert!(
+            out.status.success(),
+            "daemon failed to start:\n{}",
+            String::from_utf8_lossy(&out.stderr),
+        );
         // Pre-warm: open lib.rs and wait for rust-analyzer to finish analyzing it.
         // Without this, the first definition/hover query on a cold daemon may get
         // empty results because rust-analyzer hasn't indexed the file yet.

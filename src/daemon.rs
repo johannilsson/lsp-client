@@ -316,6 +316,7 @@ fn handle_connection(
                 }
                 let result = json!({
                     "version": env!("CARGO_PKG_VERSION"),
+                    "build": crate::session_file::build_id(),
                     "import": {
                         "state": core.facts.import.state(),
                         "problems": core.facts.import.failures,
@@ -599,6 +600,7 @@ pub fn run_daemon(
         server_log: core.facts.server_log.clone(),
         profile: core.profile.name().to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        build: crate::session_file::build_id(),
     };
     info.save()?;
 
