@@ -14,9 +14,12 @@
 //! receives the cached init response, makes its LSP calls, and disconnects —
 //! the server process never sees the disconnect.
 //!
-//! Request handling is sequential: the daemon handles one socket client at a
-//! time.  This is correct for LSP (which is already sequential in practice)
-//! and avoids needing an async runtime.
+//! Each socket client gets its own thread, but the conversation with the
+//! server stays sequential: a client holds the server lock for one message at
+//! a time (a request and its response, or a notification and the settle after
+//! it), so every response goes back to the client that asked.  Control
+//! messages that do not need the server (`lsp-client/status`,
+//! `lsp-client/stop`) are answered without waiting for that lock.
 
 use crate::servers::{self, ServerFacts, ServerProfile};
 use crate::session_file::{unix_timestamp, SessionInfo};
@@ -26,7 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -73,6 +78,23 @@ struct DaemonCore {
     /// Answer for the server's "which build tool?" question (`--build-tool`), for the
     /// profiles whose server asks one.
     build_tool: Option<String>,
+    /// Copy of the import state for `lsp-client/status`, which must be answered
+    /// while another client holds the server lock.
+    status: Arc<Mutex<StatusSnapshot>>,
+}
+
+/// What `lsp-client/status` reports about the import, kept up to date by
+/// [`DaemonCore::publish_status`].
+#[derive(Default, Clone)]
+struct StatusSnapshot {
+    import_state: &'static str,
+    import_problems: Vec<String>,
+}
+
+/// Lock a mutex even if a thread panicked while holding it: the daemon's state
+/// stays usable, and one failed client must not stop the others.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Answer to a server-initiated request that no profile answered.
@@ -100,6 +122,14 @@ impl DaemonCore {
         for msg in self.early.take().unwrap_or_default() {
             self.profile.on_message(&msg, &mut self.facts);
         }
+        self.publish_status();
+    }
+
+    fn publish_status(&self) {
+        *lock(&self.status) = StatusSnapshot {
+            import_state: self.facts.import.state(),
+            import_problems: self.facts.import.failures.clone(),
+        };
     }
 
     /// Send a JSON-RPC request to the server and return its response.
@@ -145,6 +175,7 @@ impl DaemonCore {
             early.push(msg.clone());
         }
         self.profile.on_message(msg, &mut self.facts);
+        self.publish_status();
         match method {
             // A created token only counts once it begins: kotlin-lsp creates
             // tokens and then cancels the create request without using them.
@@ -245,20 +276,45 @@ impl DaemonCore {
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
-/// Handle one connected CLI client.  Returns `true` if the daemon should stop
-/// (server died or client sent the internal lsp-client/stop notification).
-fn handle_connection(
-    stream: UnixStream,
-    core: &mut DaemonCore,
-    init_result: &Value,
-) -> bool {
+/// State shared by the accept loop and the client threads.
+struct Shared {
+    core: Mutex<DaemonCore>,
+    /// Same as the core's, reachable without the server lock.
+    status: Arc<Mutex<StatusSnapshot>>,
+    init_result: Value,
+    verbose: bool,
+    /// Set by `lsp-client/stop`, or when the server is gone.
+    stop: AtomicBool,
+    /// The server stopped answering: skip the graceful shutdown.
+    server_dead: AtomicBool,
+    /// Connected clients; the idle timeout only runs while there are none.
+    active: AtomicUsize,
+    last_activity: Mutex<Instant>,
+}
+
+impl Shared {
+    fn touch(&self) {
+        *lock(&self.last_activity) = Instant::now();
+    }
+
+    fn server_gone(&self) {
+        self.server_dead.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Handle one connected CLI client until it disconnects.  Asks the daemon to
+/// stop (through `shared`) on `lsp-client/stop`, or if the server is gone.
+fn handle_connection(stream: UnixStream, shared: &Shared) {
+    // Not from the core: that would wait for the server lock.
+    let verbose = shared.verbose;
     let mut reader = match stream.try_clone() {
         Ok(s) => MessageReader::new(s),
         Err(e) => {
-            if core.verbose {
+            if verbose {
                 eprintln!("[DAEMON] failed to clone socket: {e}");
             }
-            return false;
+            return;
         }
     };
     let mut writer = stream;
@@ -266,26 +322,27 @@ fn handle_connection(
     loop {
         let msg = match reader.read_message() {
             Ok(m) => m,
-            Err(_) => return false, // client disconnected
+            Err(_) => return, // client disconnected
         };
+        shared.touch();
 
         let method = msg.get("method").and_then(|v| v.as_str());
         let has_id = msg.get("id").is_some();
 
-        if core.verbose
+        if verbose
             && let Some(m) = method {
                 eprintln!("[DAEMON] client >>> {m}");
             }
 
         match method {
             // ------------------------------------------------------------------
-            // Intercepted lifecycle messages
+            // Intercepted lifecycle messages (no server lock needed)
             // ------------------------------------------------------------------
             Some("initialize") => {
                 // Return the cached init result so the client's LspSession works
                 // without modification.
                 let resp =
-                    json!({"jsonrpc":"2.0","id":msg["id"],"result":init_result});
+                    json!({"jsonrpc":"2.0","id":msg["id"],"result":shared.init_result});
                 let _ = send_framed(&mut writer, &resp);
             }
             Some("initialized") => {
@@ -298,7 +355,7 @@ fn handle_connection(
             }
             Some("exit") => {
                 // Client is done — close this connection, daemon keeps running.
-                return false;
+                return;
             }
 
             // ------------------------------------------------------------------
@@ -306,20 +363,25 @@ fn handle_connection(
             // ------------------------------------------------------------------
             Some("lsp-client/stop") => {
                 // Signal to the main loop that the daemon should shut down.
-                return true;
+                shared.stop.store(true, Ordering::SeqCst);
+                return;
             }
             Some("lsp-client/status") => {
                 // Messages the server sent while no client was connected are
-                // still queued; take them into account before answering.
-                while let Ok(queued) = core.server_rx.try_recv() {
-                    core.observe(&queued);
+                // still queued: if nobody holds the server, take them into
+                // account first.  If somebody does, it is reading them already.
+                if let Ok(mut core) = shared.core.try_lock() {
+                    while let Ok(queued) = core.server_rx.try_recv() {
+                        core.observe(&queued);
+                    }
                 }
+                let status = lock(&shared.status).clone();
                 let result = json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "build": crate::session_file::build_id(),
                     "import": {
-                        "state": core.facts.import.state(),
-                        "problems": core.facts.import.failures,
+                        "state": status.import_state,
+                        "problems": status.import_problems,
                     },
                 });
                 let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
@@ -332,11 +394,13 @@ fn handle_connection(
                     .as_u64()
                     .map(Duration::from_millis)
                     .unwrap_or(Duration::from_secs(300));
+                let mut core = lock(&shared.core);
                 let idle = core.wait_for_idle(max_wait, true);
                 let result = json!({
                     "status": if idle { "idle" } else { "timeout" },
                     "importFailures": core.facts.import.failures,
                 });
+                drop(core);
                 let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
                 let _ = send_framed(&mut writer, &resp);
             }
@@ -345,51 +409,14 @@ fn handle_connection(
             // Notifications (no id): forward to server, wait for it to settle.
             // ------------------------------------------------------------------
             Some(_) if !has_id => {
-                // Convert a repeat textDocument/didOpen into textDocument/didChange.
-                // Each CLI invocation sends didOpen with current file content, but
-                // the LSP spec forbids opening a document that is already open.
-                // By rewriting to didChange after the first open, the server sees
-                // correct content updates without a protocol violation.
-                let forwarded = if msg.get("method").and_then(|v| v.as_str())
-                    == Some("textDocument/didOpen")
-                {
-                    let uri = msg["params"]["textDocument"]["uri"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(version) = core.opened_versions.get_mut(&uri) {
-                        *version += 1;
-                        let new_version = *version;
-                        let text = msg["params"]["textDocument"]["text"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        if core.verbose {
-                            eprintln!(
-                                "[DAEMON] rewriting didOpen → didChange v{new_version} for {uri}"
-                            );
-                        }
-                        json!({
-                            "jsonrpc": "2.0",
-                            "method": "textDocument/didChange",
-                            "params": {
-                                "textDocument": {"uri": uri, "version": new_version},
-                                "contentChanges": [{"text": text}]
-                            }
-                        })
-                    } else {
-                        core.opened_versions.insert(uri, 1);
-                        msg
-                    }
-                } else {
-                    msg
-                };
-
+                let mut core = lock(&shared.core);
+                let forwarded = rewrite_repeat_open(&mut core, msg);
                 if let Err(e) = core.send_raw(&forwarded) {
                     if core.verbose {
                         eprintln!("[DAEMON] write to server failed: {e}");
                     }
-                    return true; // server dead
+                    shared.server_gone();
+                    return;
                 }
                 // Block until the server finishes any background work triggered
                 // by this notification (e.g., indexing after didOpen/didChange).
@@ -399,20 +426,27 @@ fn handle_connection(
             }
 
             // ------------------------------------------------------------------
-            // Requests: proxy to server, route response back.
+            // Requests: proxy to server, route response back.  The lock is held
+            // until the response arrives, so it can only be this client's.
             // ------------------------------------------------------------------
             _ => {
+                let mut core = lock(&shared.core);
                 if let Err(e) = core.send_raw(&msg) {
                     if core.verbose {
                         eprintln!("[DAEMON] write to server failed: {e}");
                     }
-                    return true; // server dead
+                    shared.server_gone();
+                    return;
                 }
                 let req_id = msg.get("id").cloned().unwrap_or(Value::Null);
-                loop {
+                let response = loop {
                     let server_msg = match core.server_rx.recv() {
                         Ok(m) => m,
-                        Err(_) => return true, // server reader thread died
+                        Err(_) => {
+                            // server reader thread died
+                            shared.server_gone();
+                            return;
+                        }
                     };
 
                     // Server-initiated messages are acked/tracked internally,
@@ -422,13 +456,44 @@ fn handle_connection(
                     }
 
                     if server_msg.get("id") == Some(&req_id) {
-                        let _ = send_framed(&mut writer, &server_msg);
-                        break;
+                        break server_msg;
                     }
-                }
+                };
+                drop(core);
+                let _ = send_framed(&mut writer, &response);
             }
         }
     }
+}
+
+/// Convert a repeat textDocument/didOpen into textDocument/didChange.
+/// Each CLI invocation sends didOpen with current file content, but the LSP
+/// spec forbids opening a document that is already open.  By rewriting to
+/// didChange after the first open, the server sees correct content updates
+/// without a protocol violation.
+fn rewrite_repeat_open(core: &mut DaemonCore, msg: Value) -> Value {
+    if msg.get("method").and_then(|v| v.as_str()) != Some("textDocument/didOpen") {
+        return msg;
+    }
+    let uri = msg["params"]["textDocument"]["uri"].as_str().unwrap_or("").to_string();
+    let Some(version) = core.opened_versions.get_mut(&uri) else {
+        core.opened_versions.insert(uri, 1);
+        return msg;
+    };
+    *version += 1;
+    let new_version = *version;
+    let text = msg["params"]["textDocument"]["text"].as_str().unwrap_or("").to_string();
+    if core.verbose {
+        eprintln!("[DAEMON] rewriting didOpen → didChange v{new_version} for {uri}");
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": uri, "version": new_version},
+            "contentChanges": [{"text": text}]
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +564,7 @@ pub fn run_daemon(
         facts: ServerFacts::default(),
         early: Some(Vec::new()),
         build_tool: options.build_tool.clone(),
+        status: Arc::new(Mutex::new(StatusSnapshot::default())),
     };
 
     // ---- LSP initialisation -------------------------------------------------
@@ -611,34 +677,50 @@ pub fn run_daemon(
 
     // ---- Main accept loop ---------------------------------------------------
 
-    let mut last_activity = Instant::now();
-    let mut stop = false;
+    let shared = Arc::new(Shared {
+        status: core.status.clone(),
+        core: Mutex::new(core),
+        init_result,
+        verbose,
+        stop: AtomicBool::new(false),
+        server_dead: AtomicBool::new(false),
+        active: AtomicUsize::new(0),
+        last_activity: Mutex::new(Instant::now()),
+    });
 
     loop {
+        if shared.stop.load(Ordering::SeqCst) {
+            break;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 // The listener is non-blocking (for the idle-timeout loop), but accepted
                 // sockets inherit that flag on Unix.  Set back to blocking so that
                 // read_message() in handle_connection works correctly.
                 let _ = stream.set_nonblocking(false);
-                last_activity = Instant::now();
+                shared.touch();
+                shared.active.fetch_add(1, Ordering::SeqCst);
                 if verbose {
                     eprintln!("[DAEMON] client connected");
                 }
-                stop = handle_connection(stream, &mut core, &init_result);
-                if verbose {
-                    eprintln!("[DAEMON] client disconnected");
-                }
-                if stop {
-                    break;
-                }
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    handle_connection(stream, &shared);
+                    shared.touch();
+                    shared.active.fetch_sub(1, Ordering::SeqCst);
+                    if verbose {
+                        eprintln!("[DAEMON] client disconnected");
+                    }
+                });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if idle_secs > 0 && last_activity.elapsed().as_secs() >= idle_secs {
+                let idle = shared.active.load(Ordering::SeqCst) == 0
+                    && lock(&shared.last_activity).elapsed().as_secs() >= idle_secs;
+                if idle_secs > 0 && idle {
                     eprintln!("[DAEMON] idle timeout — shutting down");
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
                 eprintln!("[DAEMON] accept error: {e}");
@@ -649,13 +731,27 @@ pub fn run_daemon(
 
     // ---- Cleanup ------------------------------------------------------------
 
+    // Remove the session file first, so `session stop` sees the daemon go at
+    // once even if another client is still in the middle of a query.
     SessionInfo::delete(&canonical_root);
     let _ = std::fs::remove_file(&socket_path);
 
-    // Gracefully shut down the LSP server unless it already crashed.
-    if !stop {
-        let _ = core.request("shutdown", json!({}));
-        let _ = core.notify("exit", json!({}));
+    // Gracefully shut down the LSP server after an idle timeout (as before, not
+    // after a stop request or a dead server).  Another client may still hold the
+    // server: give it a few seconds, then just kill the server.
+    if !shared.stop.load(Ordering::SeqCst) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(mut core) = shared.core.try_lock() {
+                let _ = core.request("shutdown", json!({}));
+                let _ = core.notify("exit", json!({}));
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     // Give the server a moment to exit before we drop the pipes.
@@ -684,6 +780,7 @@ mod tests {
             facts: ServerFacts::default(),
             early: Some(Vec::new()),
             build_tool: None,
+            status: Arc::new(Mutex::new(StatusSnapshot::default())),
         }
     }
 

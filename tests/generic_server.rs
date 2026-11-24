@@ -4,7 +4,7 @@
 // must not change how the others are treated. These tests use a tiny fake server
 // (tests/fixtures/fake_lsp.py, needs python3) and a server that dies at startup.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -255,4 +255,62 @@ fn a_daemon_from_another_build_of_the_same_version_is_reported() {
         "{}",
         stderr(&other)
     );
+}
+
+/// `query hover` on `line` of `file`, started in the background.
+fn spawn_hover(ws: &Workspace, file: &Path, line: u32) -> std::process::Child {
+    Command::new(BINARY)
+        .args(["--root", ws.0.to_str().unwrap(), "query", "hover", file.to_str().unwrap(), &line.to_string(), "1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run lsp-client")
+}
+
+#[test]
+fn session_status_answers_while_another_client_runs_a_slow_query() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("status-while-busy");
+    let out = ws.start_fake(&[], &[("FAKE_LSP_HOVER_DELAY", "6")]);
+    assert!(out.status.success(), "start failed: {}", stderr(&out));
+
+    let file = ws.0.join("a.txt");
+    let started = Instant::now();
+    let hover = spawn_hover(&ws, &file, 1);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let asked = Instant::now();
+    let status = ws.run(&["session", "status"]);
+    let took = asked.elapsed();
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("import:      n/a"), "{}", String::from_utf8_lossy(&status.stdout));
+    assert!(took < Duration::from_secs(3), "status waited for the query: {took:?}");
+
+    let hover = hover.wait_with_output().unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(6), "the hover was not slow, so this proved nothing");
+    assert!(String::from_utf8_lossy(&hover.stdout).contains("at line 1"), "{}", stderr(&hover));
+}
+
+#[test]
+fn parallel_queries_each_get_their_own_answer() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("parallel-queries");
+    std::fs::write(ws.0.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let out = ws.start_fake(&[], &[("FAKE_LSP_HOVER_DELAY", "1")]);
+    assert!(out.status.success(), "start failed: {}", stderr(&out));
+
+    let file = ws.0.join("a.txt");
+    let children: Vec<_> = (1..=3).map(|line| (line, spawn_hover(&ws, &file, line))).collect();
+    for (line, child) in children {
+        let o = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success(), "hover {line}: {}", stderr(&o));
+        assert!(stdout.contains(&format!("at line {line}\n")) || stdout.trim_end().ends_with(&format!("at line {line}")), "hover {line} got: {stdout}");
+    }
 }
