@@ -40,6 +40,16 @@ lsp-client query semantic-tokens   <file>
 lsp-client query inlay-hints       <file> [--start-line N] [--end-line N]
 ```
 
+Lines and columns are 1-based; a column counts characters. A position can also be written the way compilers and grep print one, or by name instead of a column:
+
+```sh
+lsp-client query hover src/main.rs:12:9               # same as src/main.rs 12 9
+lsp-client query definition src/main.rs:12 --symbol total
+lsp-client query rename src/main.rs 12 sum --symbol total
+```
+
+`--symbol` uses the first occurrence of the name on that line, as a whole identifier (so `total` does not match inside `total_of`), and says so on stderr when the line has it more than once. When a position query finds nothing, a note on stderr says what is at the position, such as `no symbol at 12:4 (whitespace); nearest identifier: total at 12:9`, so a wrong column is not mistaken for "there is no definition". stdout and `--json` are not affected.
+
 ### Session subcommands
 
 ```
@@ -152,7 +162,7 @@ The profile is chosen after the server answers `initialize`: from the server's o
 ### kotlin-lsp (Kotlin)
 
 ```sh
-# macOS
+# macOS (not tried, see "Platforms" under Known limitations)
 brew install JetBrains/utils/kotlin-lsp
 # Linux/Windows: download the standalone archive from
 # https://github.com/Kotlin/kotlin-lsp/releases, unpack it and put bin/intellij-server
@@ -232,6 +242,8 @@ Query commands auto-detect a running daemon for the project root. If a daemon is
 Pass `--tcp` to bypass the daemon entirely and connect directly to a TCP language server (e.g. kotlin-lsp on port 9999). This is useful when a server is already running — for example, started by an IDE — and you want to share it. Add `--server <binary>` to auto-start the server if none is listening. Starting the server needs to know which flags make it listen on a port, which differs between servers, so it only works for servers whose profile knows them (today kotlin-lsp, recognised by `--server-profile kotlin-lsp` or by its binary name). For any other server, start it yourself and use `--tcp` to connect, or leave `--tcp` out.
 
 ## Known limitations
+
+**Platforms:** everything was tested on Linux x64 only (kotlin-lsp 271.2085.0, rust-analyzer). macOS has not been tried: it should build, but the daemon's liveness check, its paths under `/tmp` and the session-file cache directory have never been run there, and neither has the `brew install JetBrains/utils/kotlin-lsp` line above. Windows does not work in daemon mode, because the CLI talks to the daemon over a Unix domain socket (on other platforms that code compiles to stubs that fail with "Unix sockets not available on this platform"). Only direct TCP mode (`--tcp`) can work there, against a server you start yourself. Tracked in [#35](https://github.com/johannilsson/lsp-client/issues/35).
 
 **Android projects (kotlin-lsp):** Android Gradle Plugin support in kotlin-lsp is experimental. Tested with kotlin-lsp 271.2085.0 on an AGP 9.5 / Gradle 9.8 app that uses a JVM-only `includeBuild`: once the Gradle sync succeeds, hover, definition, references, workspace symbols and diagnostics work, including across the included build and into library jars. Things to watch for:
 

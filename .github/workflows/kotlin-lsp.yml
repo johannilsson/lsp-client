@@ -1,0 +1,64 @@
+name: kotlin-lsp
+
+# Runs tests/kotlin_lsp.rs against a real kotlin-lsp. The import handling relies on
+# `intellij/workspaceImportStatus` and `intellij/workspaceImportState`, which are not
+# documented, so a failure after a kotlin-lsp release is the signal to look at what
+# changed. Kept out of the pull-request checks: it downloads about 370 MB and the
+# tests take about a minute.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays
+  workflow_dispatch:
+    inputs:
+      version:
+        description: kotlin-lsp version to download
+        default: "271.2085.0"
+
+env:
+  # Bump when a newer kotlin-lsp has been checked; run by hand with another
+  # version to try it first.
+  KOTLIN_LSP_VERSION: ${{ inputs.version || '271.2085.0' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Gradle fixtures run the project's build, which needs a JDK.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache the kotlin-lsp archive
+        uses: actions/cache@v4
+        with:
+          path: kotlin-server.tar.gz
+          key: kotlin-lsp-${{ env.KOTLIN_LSP_VERSION }}
+
+      - name: Download kotlin-lsp and check its SHA-256
+        run: |
+          base="https://download.jetbrains.com/language-server/kotlin-server/${KOTLIN_LSP_VERSION}"
+          name="kotlin-server-${KOTLIN_LSP_VERSION}.tar.gz"
+          [ -f kotlin-server.tar.gz ] || curl -fsSL -o kotlin-server.tar.gz "$base/$name"
+          # The published checksum names the archive, so check it under that name.
+          curl -fsSL "$base/$name.sha256" | awk '{print $1}' > expected.sha256
+          echo "$(cat expected.sha256)  kotlin-server.tar.gz" | sha256sum -c -
+
+      - name: Install kotlin-lsp on PATH
+        run: |
+          mkdir -p "$HOME/kotlin-lsp" "$HOME/bin"
+          tar xzf kotlin-server.tar.gz -C "$HOME/kotlin-lsp" --strip-components=1
+          # A wrapper, not a symlink, so the server finds its own lib/ and jbr/.
+          printf '#!/bin/sh\nexec "%s/kotlin-lsp/bin/intellij-server" "$@"\n' "$HOME" > "$HOME/bin/kotlin-lsp"
+          chmod +x "$HOME/bin/kotlin-lsp"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: kotlin-lsp version
+        run: kotlin-lsp --version
+
+      - name: Test (kotlin-lsp)
+        run: cargo test --test kotlin_lsp -- --test-threads=1 --nocapture
