@@ -315,6 +315,7 @@ fn handle_connection(
                     core.observe(&queued);
                 }
                 let result = json!({
+                    "version": env!("CARGO_PKG_VERSION"),
                     "import": {
                         "state": core.facts.import.state(),
                         "problems": core.facts.import.failures,
@@ -597,6 +598,7 @@ pub fn run_daemon(
         initialized: true,
         server_log: core.facts.server_log.clone(),
         profile: core.profile.name().to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     info.save()?;
 

@@ -17,6 +17,9 @@ pub struct SessionInfo {
     /// Name of the server profile in use (see `servers`); empty in session files
     /// written before profiles existed.
     pub profile: String,
+    /// lsp-client version that started the daemon; empty in session files
+    /// written before this field existed.
+    pub version: String,
 }
 
 /// Stable, deterministic hash of a workspace path used as the session filename.
@@ -58,6 +61,7 @@ impl SessionInfo {
             initialized: v["initialized"].as_bool().unwrap_or(false),
             server_log: v["server_log"].as_str().map(str::to_owned),
             profile: v["profile"].as_str().unwrap_or("").to_owned(),
+            version: v["version"].as_str().unwrap_or("").to_owned(),
         })
     }
 
@@ -76,12 +80,32 @@ impl SessionInfo {
             "initialized": self.initialized,
             "server_log":  self.server_log,
             "profile":     self.profile,
+            "version":     self.version,
         });
         std::fs::write(path, v.to_string())
     }
 
     pub fn delete(workspace: &str) {
         let _ = std::fs::remove_file(session_path(workspace));
+    }
+
+    /// A warning if the daemon was started by a different lsp-client build than
+    /// this one: it may not understand newer requests, and would answer them
+    /// with an error that is easy to miss.
+    pub fn version_mismatch_warning(&self) -> Option<String> {
+        let ours = env!("CARGO_PKG_VERSION");
+        if self.version == ours {
+            return None;
+        }
+        let theirs = if self.version.is_empty() {
+            "an older version".to_owned()
+        } else {
+            self.version.clone()
+        };
+        Some(format!(
+            "Warning: the daemon was started by lsp-client {theirs}, this is {ours}: \
+             run `lsp-client session stop` so the next command starts a matching one."
+        ))
     }
 
     /// Returns true if the daemon process is still running.
@@ -102,4 +126,36 @@ pub fn unix_timestamp() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(version: &str) -> SessionInfo {
+        SessionInfo {
+            workspace: "/w".into(),
+            server: "s".into(),
+            language_id: "x".into(),
+            pid: 1,
+            socket: "/s".into(),
+            started_at: 0,
+            initialized: true,
+            server_log: None,
+            profile: String::new(),
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn matching_version_does_not_warn() {
+        assert!(info(env!("CARGO_PKG_VERSION")).version_mismatch_warning().is_none());
+    }
+
+    #[test]
+    fn other_or_missing_version_warns() {
+        let w = info("0.0.1").version_mismatch_warning().unwrap();
+        assert!(w.contains("0.0.1") && w.contains("session stop"));
+        assert!(info("").version_mismatch_warning().unwrap().contains("an older version"));
+    }
 }
