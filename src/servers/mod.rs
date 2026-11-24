@@ -59,6 +59,9 @@ pub struct ServerFacts {
     pub import: ImportState,
     /// The server's own log file, if it announces one.
     pub server_log: Option<String>,
+    /// The server asked which build tool to use (kotlin-lsp's "Use Gradle / Use
+    /// Maven"), so `--build-tool` had something to answer.
+    pub build_tool_asked: bool,
 }
 
 /// Hooks a profile can override. Every hook has a do-nothing default, so the
@@ -102,6 +105,12 @@ pub trait ServerProfile: Send {
     /// read; without it a profile that needs the text keeps the diagnostic.
     fn keep_diagnostic(&self, _diagnostic: &Value, _source: Option<&str>) -> bool {
         true
+    }
+
+    /// Notes to print (on stderr) after the diagnostics of a file, e.g. what a known
+    /// error usually means with this server. One line each.
+    fn diagnostics_notes(&self, _diagnostics: &[&Value]) -> Vec<String> {
+        Vec::new()
     }
 }
 

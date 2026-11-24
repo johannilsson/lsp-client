@@ -132,6 +132,23 @@ impl DaemonCore {
         };
     }
 
+    /// Notes for `lsp-client/waitIdle` that are not failures.
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        // --build-tool only answers a question; if an import finished without one,
+        // the server chose by itself, possibly from an answer it remembered (#38).
+        if let Some(tool) = &self.build_tool
+            && self.facts.import.finished
+            && !self.facts.build_tool_asked
+        {
+            notes.push(format!(
+                "--build-tool {tool} was not used: the server did not ask which build tool to import with. \
+                 It found only one, or it is reusing the answer it remembered for this workspace."
+            ));
+        }
+        notes
+    }
+
     /// Send a JSON-RPC request to the server and return its response.
     /// Notifications and server-initiated requests that arrive while waiting
     /// are handled inline (acked or discarded).
@@ -399,6 +416,7 @@ fn handle_connection(stream: UnixStream, shared: &Shared) {
                 let result = json!({
                     "status": if idle { "idle" } else { "timeout" },
                     "importFailures": core.facts.import.failures,
+                    "notes": core.notes(),
                 });
                 drop(core);
                 let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":result});
@@ -895,6 +913,23 @@ mod tests {
         assert!(kept.starts_with("[lsp-client: earlier output dropped]"), "{kept}");
         assert!(kept.ends_with("line 0299\n"), "{kept}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unused_build_tool_gets_a_note_once_the_import_finished() {
+        let mut core = core_for_test();
+        core.build_tool = Some("maven".into());
+        assert!(core.notes().is_empty(), "no import yet");
+        core.facts.import.expected = true;
+        core.facts.import.finished = true;
+        let notes = core.notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("--build-tool maven was not used"), "{}", notes[0]);
+        core.facts.build_tool_asked = true;
+        assert!(core.notes().is_empty());
+        core.build_tool = None;
+        core.facts.build_tool_asked = false;
+        assert!(core.notes().is_empty());
     }
 
     #[test]

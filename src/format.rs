@@ -337,22 +337,20 @@ pub fn format_workspace_symbols(resp: &Value, profile: &dyn ServerProfile) -> St
 
 /// Diagnostics as text.
 ///
+/// The diagnostics in a `textDocument/diagnostic` (or published) answer.
+pub fn diagnostic_items(resp: &Value) -> Vec<&Value> {
+    let result = &resp["result"];
+    let items = result.as_array().or_else(|| result.get("items").and_then(|v| v.as_array()));
+    items.map(|a| a.iter().collect()).unwrap_or_default()
+}
+
 /// `source` is the text of the file, for profiles that need it to decide what to
 /// show. The profile may leave diagnostics out (kotlin-lsp: `FunctionName` warnings
 /// on `@Composable` functions, which Compose names in UpperCase on purpose);
 /// `show_all` shows everything the server reported.
 pub fn format_diagnostics(resp: &Value, source: Option<&str>, show_all: bool, profile: &dyn ServerProfile) -> String {
-    let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
-        return "No diagnostics.".into();
-    };
-    let items = if result.is_array() {
-        result.as_array().unwrap()
-    } else if let Some(arr) = result.get("items").and_then(|v| v.as_array()) {
-        arr
-    } else {
-        return "No diagnostics.".into();
-    };
-    let items: Vec<&Value> = items.iter().filter(|d| show_all || profile.keep_diagnostic(d, source)).collect();
+    let items: Vec<&Value> =
+        diagnostic_items(resp).into_iter().filter(|d| show_all || profile.keep_diagnostic(d, source)).collect();
     if items.is_empty() {
         return "No diagnostics.".into();
     }

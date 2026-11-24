@@ -447,14 +447,17 @@ fn main() {
                                 std::process::exit(2);
                             }
                             Ok(outcome) if !outcome.idle => {
+                                outcome.print_notes();
                                 eprintln!("Warning: server still busy (indexing not finished) for {root}");
                                 std::process::exit(2);
                             }
                             Ok(outcome) if !outcome.import_failures.is_empty() => {
+                                outcome.print_notes();
                                 outcome.warn_import_failures();
                                 std::process::exit(3);
                             }
-                            Ok(_) => {
+                            Ok(outcome) => {
+                                outcome.print_notes();
                                 eprintln!("lsp-client daemon ready (indexing complete) for {root}");
                             }
                         }
@@ -764,6 +767,7 @@ fn main() {
         {
             if use_daemon {
                 let outcome = session.wait_idle_request(*wait_timeout)?;
+                outcome.print_notes();
                 if !outcome.idle {
                     eprintln!("Timed out waiting for server to become idle.");
                     std::process::exit(2);
@@ -933,6 +937,11 @@ fn main() {
                     } else {
                         let source = std::fs::read_to_string(&abs).ok();
                         println!("{}", format_diagnostics(&resp, source.as_deref(), *all, &*profile))
+                    }
+                    // What a known error means with this server (kotlin-lsp: missing
+                    // generated sources). On stderr, so the answer is unchanged.
+                    for note in profile.diagnostics_notes(&diagnostic_items(&resp)) {
+                        eprintln!("Note: {note}");
                     }
                 }
                 QueryCommand::Completion { file, line, col } => {
