@@ -40,6 +40,16 @@ lsp-client query semantic-tokens   <file>
 lsp-client query inlay-hints       <file> [--start-line N] [--end-line N]
 ```
 
+Lines and columns are 1-based; a column counts characters. A position can also be written the way compilers and grep print one, or by name instead of a column:
+
+```sh
+lsp-client query hover src/main.rs:12:9               # same as src/main.rs 12 9
+lsp-client query definition src/main.rs:12 --symbol total
+lsp-client query rename src/main.rs 12 sum --symbol total
+```
+
+`--symbol` uses the first occurrence of the name on that line, as a whole identifier (so `total` does not match inside `total_of`), and says so on stderr when the line has it more than once. When a position query finds nothing, a note on stderr says what is at the position, such as `no symbol at 12:4 (whitespace); nearest identifier: total at 12:9`, so a wrong column is not mistaken for "there is no definition". stdout and `--json` are not affected.
+
 ### Session subcommands
 
 ```

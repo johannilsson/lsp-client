@@ -5,6 +5,25 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The identifiers on a line, as (0-based character index, text).
+pub fn identifiers(line: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if is_ident(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_ident(chars[i]) {
+                i += 1;
+            }
+            out.push((start, chars[start..i].iter().collect()));
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// What is at 1-based `line`:`col` of `text`, for a query that found nothing.
 /// Columns count characters.
 pub fn describe(text: &str, line: u32, col: u32) -> String {
@@ -31,27 +50,17 @@ pub fn describe(text: &str, line: u32, col: u32) -> String {
     }
     let what = if chars[idx].is_whitespace() { "whitespace".to_owned() } else { format!("`{}`", chars[idx]) };
     // Nearest identifier on the same line, by distance from the cursor.
-    let mut best: Option<(usize, usize, usize)> = None; // (distance, start, end)
-    let mut i = 0;
-    while i < chars.len() {
-        if is_ident(chars[i]) {
-            let start = i;
-            while i < chars.len() && is_ident(chars[i]) {
-                i += 1;
-            }
-            let end = i - 1;
+    let best = identifiers(src)
+        .into_iter()
+        .map(|(start, word)| {
+            let end = start + word.chars().count() - 1;
             let dist = if idx < start { start - idx } else { idx - end };
-            if best.is_none_or(|(d, _, _)| dist < d) {
-                best = Some((dist, start, end));
-            }
-        } else {
-            i += 1;
-        }
-    }
+            (dist, start, word)
+        })
+        .min_by_key(|(dist, _, _)| *dist);
     match best {
-        Some((_, s, e)) => {
-            let word: String = chars[s..=e].iter().collect();
-            format!("no symbol at {line}:{col} ({what}); nearest identifier: `{word}` at {line}:{}", s + 1)
+        Some((_, start, word)) => {
+            format!("no symbol at {line}:{col} ({what}); nearest identifier: `{word}` at {line}:{}", start + 1)
         }
         None => format!("no symbol at {line}:{col} ({what}); there is no identifier on that line"),
     }
