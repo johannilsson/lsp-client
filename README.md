@@ -48,6 +48,8 @@ lsp-client query definition src/main.rs:12 --symbol total
 lsp-client query rename src/main.rs 12 sum --symbol total
 ```
 
+`query rename` does not change any file: it prints each place the rename would change as `path:line:col  old → new`. The server's edits are applied to the file on disk to show the whole new name, since a server may send only part of it (kotlin-lsp renames `result` to `total` by deleting `resul` and inserting `otal`). `--json` returns the server's edits as they are.
+
 `--symbol` uses the first occurrence of the name on that line, as a whole identifier (so `total` does not match inside `total_of`), and says so on stderr when the line has it more than once. When a position query finds nothing, a note on stderr says what is at the position, such as `no symbol at 12:4 (whitespace); nearest identifier: total at 12:9`, so a wrong column is not mistaken for "there is no definition". stdout and `--json` are not affected.
 
 ### Session subcommands

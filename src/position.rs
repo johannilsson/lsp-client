@@ -1,7 +1,7 @@
 //! Explains an empty answer to a position query: says what is at the position,
 //! so a column that landed on whitespace is not mistaken for "no definition".
 
-fn is_ident(c: char) -> bool {
+pub(crate) fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 

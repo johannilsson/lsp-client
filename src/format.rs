@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use crate::position::is_ident;
 use crate::servers::ServerProfile;
 
 fn uri_to_path(uri: &str) -> &str {
@@ -439,40 +440,97 @@ pub fn format_code_actions(resp: &Value) -> String {
     }).collect::<Vec<_>>().join("\n")
 }
 
+/// The edits of a rename, as `path:line:col  old → new` for each changed name.
+/// Servers may send minimal edits (kotlin-lsp 271 renames `result` to `total` by
+/// deleting `resul` and inserting `otal`), so the edits are applied to the file
+/// on disk and each changed span is widened to the whole identifier around it.
 pub fn format_rename(resp: &Value) -> String {
+    format_rename_with(resp, |path| std::fs::read_to_string(path).ok())
+}
+
+fn format_rename_with(resp: &Value, read: impl Fn(&str) -> Option<String>) -> String {
     let Some(result) = resp.get("result").filter(|v| !v.is_null()) else {
         return "No rename result.".into();
     };
-    let mut lines = Vec::new();
 
     // documentChanges (preferred) or changes map
+    let mut docs: Vec<(&str, &[Value])> = Vec::new();
     if let Some(doc_changes) = result.get("documentChanges").and_then(|v| v.as_array()) {
         for change in doc_changes {
             let path = change["textDocument"]["uri"].as_str().map(uri_to_path).unwrap_or("?");
             if let Some(edits) = change.get("edits").and_then(|v| v.as_array()) {
-                for edit in edits {
-                    let line = edit["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
-                    let col = edit["range"]["start"]["character"].as_u64().unwrap_or(0) + 1;
-                    let new_text = edit["newText"].as_str().unwrap_or("");
-                    lines.push(format!("{path}:{line}:{col}  →  {new_text}"));
-                }
+                docs.push((path, edits));
             }
         }
     } else if let Some(changes) = result.get("changes").and_then(|v| v.as_object()) {
         for (uri, edits) in changes {
-            let path = uri_to_path(uri);
             if let Some(edits) = edits.as_array() {
-                for edit in edits {
-                    let line = edit["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
-                    let col = edit["range"]["start"]["character"].as_u64().unwrap_or(0) + 1;
-                    let new_text = edit["newText"].as_str().unwrap_or("");
-                    lines.push(format!("{path}:{line}:{col}  →  {new_text}"));
-                }
+                docs.push((uri_to_path(uri), edits));
             }
         }
     }
 
+    let mut lines = Vec::new();
+    for (path, edits) in docs {
+        let text = read(path);
+        lines.extend(rename_lines(path, text.as_deref(), edits));
+    }
     if lines.is_empty() { "No changes.".into() } else { lines.join("\n") }
+}
+
+/// A text edit on one line: 0-based line, start and end character, new text.
+struct LineEdit<'a> {
+    line: usize,
+    start: usize,
+    end: usize,
+    new_text: &'a str,
+}
+
+/// The output lines for one file's edits. An edit that spans lines, or one that
+/// does not fit the file (or no file), is shown as its range and new text.
+fn rename_lines(path: &str, text: Option<&str>, edits: &[Value]) -> Vec<String> {
+    let src: Vec<Vec<char>> = text.map(|t| t.lines().map(|l| l.chars().collect()).collect()).unwrap_or_default();
+    let mut by_line: Vec<LineEdit> = Vec::new();
+    let mut out = Vec::new();
+    for edit in edits {
+        let pos = |end: &str, key: &str| edit["range"][end][key].as_u64().unwrap_or(0) as usize;
+        let (sl, sc, el, ec) = (pos("start", "line"), pos("start", "character"), pos("end", "line"), pos("end", "character"));
+        let new_text = edit["newText"].as_str().unwrap_or("");
+        let fits = sl == el && sc <= ec && src.get(sl).is_some_and(|l| ec <= l.len()) && !new_text.contains('\n');
+        if fits {
+            by_line.push(LineEdit { line: sl, start: sc, end: ec, new_text });
+        } else {
+            out.push(format!("{path}:{}:{}-{}:{}  →  {new_text}", sl + 1, sc + 1, el + 1, ec + 1));
+        }
+    }
+    by_line.sort_by_key(|e| (e.line, e.start, e.end));
+
+    // Group the edits of a line into spans: each edit widened to the identifier
+    // around it, and edits whose spans touch merged into one.
+    let mut i = 0;
+    while i < by_line.len() {
+        let line = &src[by_line[i].line];
+        let widen_left = |mut s: usize| { while s > 0 && is_ident(line[s - 1]) { s -= 1 } s };
+        let widen_right = |mut e: usize| { while e < line.len() && is_ident(line[e]) { e += 1 } e };
+        let (start, mut end) = (widen_left(by_line[i].start), widen_right(by_line[i].end));
+        let mut j = i + 1;
+        while j < by_line.len() && by_line[j].line == by_line[i].line && by_line[j].start <= end {
+            end = end.max(widen_right(by_line[j].end));
+            j += 1;
+        }
+        let mut new = String::new();
+        let mut at = start;
+        for e in &by_line[i..j] {
+            new.extend(&line[at..e.start.max(at)]);
+            new.push_str(e.new_text);
+            at = at.max(e.end);
+        }
+        new.extend(&line[at..end]);
+        let old: String = line[start..end].iter().collect();
+        out.push(format!("{path}:{}:{}  {old} → {new}", by_line[i].line + 1, start + 1));
+        i = j;
+    }
+    out
 }
 
 // Fallback legend, used only when the server's initialize response carries
@@ -692,6 +750,48 @@ mod tests {
     use super::*;
     use crate::servers;
     use serde_json::json;
+
+    fn edit(line: u64, start: u64, end: u64, new_text: &str) -> Value {
+        json!({"range": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}}, "newText": new_text})
+    }
+
+    fn rename(edits: Vec<Value>, src: &str) -> String {
+        let resp = json!({"result": {"documentChanges": [{"textDocument": {"uri": "file:///p/A.kt", "version": 1}, "edits": edits}]}});
+        format_rename_with(&resp, |path| (path == "/p/A.kt").then(|| src.to_owned()))
+    }
+
+    const RENAME_SRC: &str = "fun f() {\n    val result = 1\n    println(result + result)\n}\n";
+
+    #[test]
+    fn a_minimal_insert_is_shown_as_the_whole_new_name() {
+        // kotlin-lsp 271 renames `result` to `resultX` by inserting `X` after it.
+        let out = rename(vec![edit(1, 14, 14, "X"), edit(2, 18, 18, "X"), edit(2, 27, 27, "X")], RENAME_SRC);
+        assert_eq!(out, "/p/A.kt:2:9  result → resultX\n/p/A.kt:3:13  result → resultX\n/p/A.kt:3:22  result → resultX");
+    }
+
+    #[test]
+    fn a_delete_and_an_insert_in_one_name_are_shown_as_one_change() {
+        // kotlin-lsp 271 renames `result` to `total` by deleting `resul`, keeping
+        // the `t` and inserting `otal` after it; here in reverse order, too.
+        let out = rename(vec![edit(1, 8, 13, ""), edit(1, 14, 14, "otal")], RENAME_SRC);
+        assert_eq!(out, "/p/A.kt:2:9  result → total");
+        let out = rename(vec![edit(2, 27, 27, "otal"), edit(2, 18, 18, "otal"), edit(2, 21, 26, ""), edit(2, 12, 17, "")], RENAME_SRC);
+        assert_eq!(out, "/p/A.kt:3:13  result → total\n/p/A.kt:3:22  result → total");
+    }
+
+    #[test]
+    fn a_whole_name_edit_and_the_changes_map_are_shown_the_same_way() {
+        let resp = json!({"result": {"changes": {"file:///p/A.kt": [edit(1, 8, 14, "total")]}}});
+        let out = format_rename_with(&resp, |_| Some(RENAME_SRC.to_owned()));
+        assert_eq!(out, "/p/A.kt:2:9  result → total");
+    }
+
+    #[test]
+    fn without_the_file_an_edit_is_shown_as_its_range() {
+        let resp = json!({"result": {"changes": {"file:///p/Gone.kt": [edit(1, 14, 14, "X")]}}});
+        assert_eq!(format_rename_with(&resp, |_| None), "/p/Gone.kt:2:15-2:15  →  X");
+        assert_eq!(format_rename_with(&json!({"result": null}), |_| None), "No rename result.");
+    }
 
     #[test]
     fn command_links_become_their_text_and_normal_links_stay() {
