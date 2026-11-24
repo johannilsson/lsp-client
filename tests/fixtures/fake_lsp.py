@@ -11,6 +11,7 @@ Environment variables change what it does:
   `window/logMessage` sent before the `initialize` answer, as kotlin-lsp does.
 - FAKE_LSP_INTELLIJ=1: also send kotlin-lsp's `intellij/workspaceImport*`
   notifications, reporting a failed import, as kotlin-lsp would.
+- FAKE_LSP_STDERR: write this line to stderr at startup.
 - FAKE_LSP_HOVER_DELAY: wait this many seconds before answering a hover, to
   stand for a slow query. The answer names the hovered line, so that parallel
   callers can each check they got their own.
@@ -40,6 +41,10 @@ def send(message):
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
 
+
+if os.environ.get("FAKE_LSP_STDERR"):
+    sys.stderr.write(os.environ["FAKE_LSP_STDERR"] + "\n")
+    sys.stderr.flush()
 
 while True:
     m = read()

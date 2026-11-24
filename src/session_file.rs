@@ -14,6 +14,9 @@ pub struct SessionInfo {
     pub initialized: bool,
     /// The server's own log file, if it announced one (kotlin-lsp does).
     pub server_log: Option<String>,
+    /// Where the daemon writes the server's stderr (see [`stderr_path`]); `None`
+    /// when it is not captured (`--verbose` shows it on the terminal instead).
+    pub server_stderr: Option<String>,
     /// Name of the server profile in use (see `servers`); empty in session files
     /// written before profiles existed.
     pub profile: String,
@@ -64,6 +67,13 @@ pub fn session_path(workspace: &str) -> PathBuf {
     sessions_dir().join(format!("{}.json", workspace_hash(workspace)))
 }
 
+/// Where the daemon for `workspace` writes its language server's stderr, next to
+/// the session file. Known from the workspace alone, so `session start` can read
+/// it when the daemon died before it wrote the session file.
+pub fn stderr_path(workspace: &str) -> PathBuf {
+    sessions_dir().join(format!("{}.stderr", workspace_hash(workspace)))
+}
+
 impl SessionInfo {
     pub fn load(workspace: &str) -> Option<Self> {
         let text = std::fs::read_to_string(session_path(workspace)).ok()?;
@@ -77,6 +87,7 @@ impl SessionInfo {
             started_at: v["started_at"].as_u64().unwrap_or(0),
             initialized: v["initialized"].as_bool().unwrap_or(false),
             server_log: v["server_log"].as_str().map(str::to_owned),
+            server_stderr: v["server_stderr"].as_str().map(str::to_owned),
             profile: v["profile"].as_str().unwrap_or("").to_owned(),
             version: v["version"].as_str().unwrap_or("").to_owned(),
             build: v["build"].as_str().unwrap_or("").to_owned(),
@@ -97,6 +108,7 @@ impl SessionInfo {
             "started_at":  self.started_at,
             "initialized": self.initialized,
             "server_log":  self.server_log,
+            "server_stderr": self.server_stderr,
             "profile":     self.profile,
             "version":     self.version,
             "build":       self.build,
@@ -164,6 +176,7 @@ mod tests {
             started_at: 0,
             initialized: true,
             server_log: None,
+            server_stderr: None,
             profile: String::new(),
             version: version.into(),
             build: "100.000000000".into(),

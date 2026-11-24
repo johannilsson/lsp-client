@@ -482,6 +482,7 @@ fn main() {
                                     "workspace":   info.workspace,
                                     "uptime":      uptime,
                                     "server_log":  info.server_log,
+                                    "server_stderr": info.server_stderr,
                                     "import": daemon.as_ref().map(|d| serde_json::json!({
                                         "state":    d.import_state,
                                         "problems": d.import_problems,
@@ -510,6 +511,8 @@ fn main() {
                             }
                             if let Some(log) = &info.server_log {
                                 println!("server log:  {log}");
+                            } else if let Some(stderr) = &info.server_stderr {
+                                println!("stderr:      {stderr}");
                             }
                             match &daemon {
                                 Some(d) => {
@@ -615,7 +618,15 @@ fn main() {
                 return;
             }
             SessionCommand::Log { lines } => {
-                let log = SessionInfo::load(root).and_then(|i| i.server_log);
+                // The server's own log if it announced one; else its stderr, which
+                // the daemon keeps after the server died, even once the daemon is gone.
+                let info = SessionInfo::load(root);
+                let log = info.as_ref().and_then(|i| i.server_log.clone()).or_else(|| {
+                    info.as_ref().and_then(|i| i.server_stderr.clone()).or_else(|| {
+                        let path = session_file::stderr_path(root);
+                        path.exists().then(|| path.to_string_lossy().into_owned())
+                    })
+                });
                 match log {
                     Some(path) => match tail_lines(&path, *lines) {
                         Ok(text) => print!("{text}"),
@@ -626,7 +637,7 @@ fn main() {
                     },
                     None => {
                         eprintln!(
-                            "No server log known for {root}: no daemon is running, or the server does not announce a log file."
+                            "No server log known for {root}: no daemon is running, and no server output was kept."
                         );
                         std::process::exit(1);
                     }
@@ -1175,11 +1186,22 @@ fn start_daemon(
         // start) will never become ready: say so now rather than after `max_wait`,
         // which follows `--timeout` and can be minutes.
         if let Some(status) = child.try_wait()? {
-            return Err(format!(
+            let mut msg = format!(
                 "the daemon exited ({status}) before it was ready; the language server probably failed to start (check that '{server}' runs, or use '{} --verbose session start' to see its output)",
                 exe.display()
-            )
-            .into());
+            );
+            // Without --verbose the daemon kept the server's stderr: show its end.
+            let stderr = session_file::stderr_path(root);
+            if let Ok(text) = tail_lines(&stderr.to_string_lossy(), 20)
+                && !text.trim().is_empty()
+            {
+                msg.push_str(&format!(
+                    "\nThe server's last output (all of it: `lsp-client session log`, or {}):\n{}",
+                    stderr.display(),
+                    text.trim_end()
+                ));
+            }
+            return Err(msg.into());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
