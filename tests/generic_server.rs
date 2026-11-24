@@ -342,3 +342,29 @@ fn parallel_queries_each_get_their_own_answer() {
         assert!(stdout.contains(&format!("at line {line}\n")) || stdout.trim_end().ends_with(&format!("at line {line}")), "hover {line} got: {stdout}");
     }
 }
+
+#[test]
+fn a_kotlin_lsp_import_failure_names_its_cause_and_an_unused_build_tool() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("kotlin-cause");
+    let log = ws.0.join("server.log");
+    std::fs::write(
+        &log,
+        "2026-11-21 11:00:01,000 [ 2000]   INFO - #i - Importing with Gradle\n\
+         2026-11-21 11:00:05,000 [ 6000]   WARN - #a - Compose Preview failed for ':app' (variant 'release'): Unit tests are disabled\n\
+         2026-11-21 11:00:05,200 [ 6200]   INFO - #i - Gradle sync failed\n",
+    )
+    .unwrap();
+    // The fake reports a failed import and never asks which build tool to use.
+    let out = ws.start_fake(
+        &["--build-tool", "maven"],
+        &[("FAKE_LSP_INTELLIJ", "1"), ("FAKE_LSP_SERVER_NAME", KOTLIN_NAME), ("FAKE_LSP_LOG_FILE", log.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("(cause, from the server log: Compose Preview failed for ':app'"), "stderr: {err}");
+    assert!(err.contains("--build-tool maven was not used"), "stderr: {err}");
+}

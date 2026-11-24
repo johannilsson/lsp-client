@@ -21,9 +21,18 @@ pub struct WaitOutcome {
     /// Folders whose project import (e.g. kotlin-lsp's Gradle sync) failed:
     /// queries in them will return little or nothing.
     pub import_failures: Vec<String>,
+    /// Things worth knowing that are not failures (e.g. `--build-tool` was
+    /// given, but the server never asked).
+    pub notes: Vec<String>,
 }
 
 impl WaitOutcome {
+    pub fn print_notes(&self) {
+        for n in &self.notes {
+            eprintln!("Note: {n}");
+        }
+    }
+
     /// Print a warning to stderr if the project import failed.
     pub fn warn_import_failures(&self) {
         for f in &self.import_failures {
@@ -331,13 +340,10 @@ impl LspSession {
         let result = &resp["result"];
         // Older daemons answer with a bare string.
         let status = result["status"].as_str().or_else(|| result.as_str()).unwrap_or("idle");
-        let import_failures = result["importFailures"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect();
-        Ok(WaitOutcome { idle: status != "timeout", import_failures })
+        let strings = |key: &str| -> Vec<String> {
+            result[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+        };
+        Ok(WaitOutcome { idle: status != "timeout", import_failures: strings("importFailures"), notes: strings("notes") })
     }
 
     /// Read and discard incoming messages until the server goes quiet and all
