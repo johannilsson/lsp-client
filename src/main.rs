@@ -419,12 +419,22 @@ fn main() {
     if let Command::Session { command } = &cli.command {
         match command {
             SessionCommand::Start { idle_timeout, wait, wait_file } => {
-                match start_daemon(&effective, cli.verbose, *idle_timeout) {
-                    Ok(()) => eprintln!("lsp-client daemon started for {root}"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
+                // One daemon per workspace: one that runs, or is still starting, is
+                // used rather than started again next to it.
+                let started = match SessionInfo::load(root).filter(|i| i.is_alive()) {
+                    Some(info) if info.initialized => {
+                        eprintln!("lsp-client daemon already running for {root} (PID {})", info.pid);
+                        Ok(())
                     }
+                    Some(info) => {
+                        eprintln!("lsp-client daemon is already starting for {root} (PID {}); waiting for it", info.pid);
+                        wait_for_starting_daemon(root, effective.timeout).map(|_| eprintln!("lsp-client daemon started for {root}")).map_err(Into::into)
+                    }
+                    None => start_daemon(&effective, cli.verbose, *idle_timeout).map(|()| eprintln!("lsp-client daemon started for {root}")),
+                };
+                if let Err(e) = started {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
                 }
                 if *wait
                     && let Some(info) = SessionInfo::load(root) {
@@ -466,6 +476,39 @@ fn main() {
             }
             SessionCommand::Status => {
                 match SessionInfo::load(root) {
+                    Some(info) if info.is_alive() && !info.initialized => {
+                        let uptime =
+                            format_uptime(unix_timestamp().saturating_sub(info.started_at));
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status":      "starting",
+                                    "pid":         info.pid,
+                                    "server_pid":  info.server_pid,
+                                    "server":      info.server,
+                                    "language_id": info.language_id,
+                                    "workspace":   info.workspace,
+                                    "uptime":      uptime,
+                                    "server_stderr": info.server_stderr,
+                                    "version":     info.version,
+                                    "build":       info.build,
+                                })
+                            );
+                        } else {
+                            println!("status:      starting (the server has not answered initialize yet)");
+                            println!("pid:         {}", info.pid);
+                            if let Some(server) = info.server_pid {
+                                println!("server pid:  {server}");
+                            }
+                            println!("server:      {}", info.server);
+                            println!("language_id: {}", info.language_id);
+                            println!("uptime:      {uptime}");
+                            if let Some(stderr) = &info.server_stderr {
+                                println!("stderr:      {stderr}");
+                            }
+                        }
+                    }
                     Some(info) if info.is_alive() => {
                         let uptime =
                             format_uptime(unix_timestamp().saturating_sub(info.started_at));
@@ -556,6 +599,23 @@ fn main() {
             }
             SessionCommand::Stop => {
                 match SessionInfo::load(root) {
+                    // Still starting: there is no socket to ask it on, so stop the
+                    // server (the daemon then fails its start and cleans up) and the
+                    // daemon itself.
+                    Some(info) if info.is_alive() && !info.initialized => {
+                        eprintln!("Stopping lsp-client daemon (PID {}), which is still starting...", info.pid);
+                        if let Some(server) = info.server_pid {
+                            kill_process(server);
+                        }
+                        kill_process(info.pid);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while info.is_alive() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        SessionInfo::delete(root);
+                        eprintln!("Done.");
+                    }
                     Some(info) if info.is_alive() => {
                         eprintln!("Stopping lsp-client daemon (PID {})...", info.pid);
                         // Ask the daemon to stop cleanly via its control message.
@@ -613,6 +673,14 @@ fn main() {
                     },
                 ) {
                     eprintln!("daemon error: {e}");
+                    // A start that failed leaves neither its "starting" session file
+                    // nor its server behind (the server may not exit by itself).
+                    if let Some(info) = SessionInfo::load(root).filter(|i| i.pid == std::process::id()) {
+                        if let Some(server) = info.server_pid {
+                            kill_process(server);
+                        }
+                        SessionInfo::delete(root);
+                    }
                     std::process::exit(1);
                 }
                 return;
@@ -1082,6 +1150,13 @@ fn connect_or_start_daemon(
     let root = &effective.root;
     // Try an existing live session first.
     if let Some(info) = SessionInfo::load(root) {
+        if info.is_alive() && !info.initialized {
+            if verbose {
+                eprintln!("[DEBUG] waiting for the daemon that is starting (PID {})", info.pid);
+            }
+            let info = wait_for_starting_daemon(root, effective.timeout)?;
+            return Transport::unix_socket(&info.socket);
+        }
         if info.is_alive() {
             if verbose {
                 eprintln!("[DEBUG] connecting to daemon at {}", info.socket);
@@ -1329,6 +1404,43 @@ fn send_stop_to_daemon(
 #[cfg(not(unix))]
 fn send_stop_to_daemon(_: &str, _: bool) -> Result<(), Box<dyn std::error::Error>> {
     Err("Unix sockets not available on this platform".into())
+}
+
+/// Send SIGTERM to `pid`; it is fine if the process is already gone.
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Wait for the daemon that is starting for `root` (its session file says
+/// `initialized: false`) to become ready, for at least 30 s or `timeout`, as
+/// `start_daemon` waits for the daemon it starts. Its session info once it is.
+fn wait_for_starting_daemon(
+    root: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<SessionInfo, String> {
+    let max_wait = timeout.unwrap_or_default().max(std::time::Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        match SessionInfo::load(root) {
+            Some(info) if info.initialized => return Ok(info),
+            Some(info) if info.is_alive() => {}
+            _ => {
+                return Err(format!(
+                    "the daemon that was starting for {root} stopped before it was ready (`lsp-client session log` may say why)"
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon for {root} is still starting after {max_wait:?} (raise --timeout, or check `lsp-client session status`)"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,12 @@ pub struct SessionInfo {
     pub pid: u32,
     pub socket: String,
     pub started_at: u64, // Unix timestamp seconds
+    /// False while the daemon is still starting: the server has not answered
+    /// `initialize` yet, and `socket` is not listening (it is empty).
     pub initialized: bool,
+    /// The language server's process id, so a daemon that is still starting can
+    /// be stopped with its server. `None` in session files written before this.
+    pub server_pid: Option<u32>,
     /// The server's own log file, if it announced one (kotlin-lsp does).
     pub server_log: Option<String>,
     /// Where the daemon writes the server's stderr (see [`stderr_path`]); `None`
@@ -86,6 +91,7 @@ impl SessionInfo {
             socket: v["socket"].as_str()?.to_owned(),
             started_at: v["started_at"].as_u64().unwrap_or(0),
             initialized: v["initialized"].as_bool().unwrap_or(false),
+            server_pid: v["server_pid"].as_u64().map(|p| p as u32),
             server_log: v["server_log"].as_str().map(str::to_owned),
             server_stderr: v["server_stderr"].as_str().map(str::to_owned),
             profile: v["profile"].as_str().unwrap_or("").to_owned(),
@@ -107,6 +113,7 @@ impl SessionInfo {
             "socket":      self.socket,
             "started_at":  self.started_at,
             "initialized": self.initialized,
+            "server_pid":  self.server_pid,
             "server_log":  self.server_log,
             "server_stderr": self.server_stderr,
             "profile":     self.profile,
@@ -175,6 +182,7 @@ mod tests {
             socket: "/s".into(),
             started_at: 0,
             initialized: true,
+            server_pid: None,
             server_log: None,
             server_stderr: None,
             profile: String::new(),

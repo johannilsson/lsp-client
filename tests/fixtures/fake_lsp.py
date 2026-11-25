@@ -15,6 +15,8 @@ Environment variables change what it does:
 - FAKE_LSP_HOVER_DELAY: wait this many seconds before answering a hover, to
   stand for a slow query. The answer names the hovered line, so that parallel
   callers can each check they got their own.
+- FAKE_LSP_INIT_DELAY: wait this many seconds before answering `initialize`,
+  as a server with a slow first import does.
 """
 import json
 import os
@@ -50,6 +52,7 @@ while True:
     m = read()
     method = m.get("method")
     if method == "initialize":
+        time.sleep(float(os.environ.get("FAKE_LSP_INIT_DELAY", "0")))
         if os.environ.get("FAKE_LSP_LOG_FILE"):
             send({"jsonrpc": "2.0", "method": "window/logMessage",
                   "params": {"type": 3, "message": "Log file: " + os.environ["FAKE_LSP_LOG_FILE"]}})

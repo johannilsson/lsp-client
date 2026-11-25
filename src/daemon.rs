@@ -607,6 +607,27 @@ pub fn run_daemon(
         std::thread::spawn(move || copy_capped(server_stderr, &path, STDERR_CAP));
     }
 
+    // Say at once that this daemon exists, though it is not ready: `initialize`
+    // can take minutes (a first kotlin-lsp import), and until now `session status`
+    // and `session stop` could not see it, nor `session start` that it was starting
+    // (#53). There is no socket yet. If the start fails, `daemon-run` removes this.
+    let mut info = SessionInfo {
+        workspace: canonical_root.clone(),
+        server: server_bin.to_owned(),
+        language_id: language_id.to_owned(),
+        pid: std::process::id(),
+        socket: String::new(),
+        started_at: unix_timestamp(),
+        initialized: false,
+        server_pid: Some(child.id()),
+        server_log: None,
+        server_stderr: stderr_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        profile: String::new(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        build: crate::session_file::build_id(),
+    };
+    info.save()?;
+
     let server_stdin = child.stdin.take().unwrap();
     let server_stdout = child.stdout.take().unwrap();
 
@@ -721,20 +742,10 @@ pub fn run_daemon(
 
     // ---- Write session file (signals to `start` that we are ready) ----------
 
-    let info = SessionInfo {
-        workspace: canonical_root.clone(),
-        server: server_bin.to_owned(),
-        language_id: language_id.to_owned(),
-        pid: std::process::id(),
-        socket: socket_path.clone(),
-        started_at: unix_timestamp(),
-        initialized: true,
-        server_log: core.facts.server_log.clone(),
-        server_stderr: stderr_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        profile: core.profile.name().to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        build: crate::session_file::build_id(),
-    };
+    info.socket = socket_path.clone();
+    info.initialized = true;
+    info.server_log = core.facts.server_log.clone();
+    info.profile = core.profile.name().to_owned();
     info.save()?;
 
     eprintln!(

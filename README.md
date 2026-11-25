@@ -59,6 +59,8 @@ lsp-client session stop       Stop the daemon
 lsp-client session wait-ready Wait until the server has finished indexing
 ```
 
+A daemon can take a while to start: the server first has to answer `initialize`, which took minutes for kotlin-lsp on a first import. Meanwhile `session status` shows `status: starting`, with the PID of the daemon and of the server, and `session stop` stops both. `session start` and queries for the same workspace wait for that daemon instead of starting a second one, and `session start` with a daemon already running says so.
+
 `session wait-ready` and `session start --wait` exit with 2 if the server is still busy when the timeout runs out, and with 3 if the project was not imported. The daemon keeps running in both cases.
 
 kotlin-lsp reports a project that was not imported in two ways, and both give exit code 3 and a warning that says what happened:
