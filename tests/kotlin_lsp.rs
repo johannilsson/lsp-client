@@ -160,10 +160,10 @@ fn failed_import_names_the_server_log_and_session_log_shows_it() {
     let out = p.start(&[]);
     assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
     let err = stderr(&out);
+    // The last `server log: `: the quoted cause before it says "from the server log: …".
     let log = err
-        .split("server log: ")
-        .nth(1)
-        .map(|rest| rest.lines().next().unwrap_or("").trim().to_string())
+        .rsplit_once("server log: ")
+        .map(|(_, rest)| rest.lines().next().unwrap_or("").trim().to_string())
         .unwrap_or_default();
     assert!(log.starts_with('/') && std::path::Path::new(&log).exists(), "no usable log path in: {err}");
     // `session status` shows the same file, and `session log` prints the end of it.

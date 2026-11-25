@@ -247,34 +247,69 @@ fn read_tail(path: &str, max: u64) -> Option<String> {
 }
 
 /// The message of a log line, without IntelliJ's `date time [ms] LEVEL - logger - `
-/// prefix (lines without it are returned as they are).
+/// prefix (lines without it are returned as they are), and without the
+/// `[IMPORT ERR]: ` / `[IMPORT STD]: ` that marks the Gradle build's own output.
 fn log_message(line: &str) -> &str {
     let starts_with_date = line.len() > 10 && line.as_bytes()[..4].iter().all(u8::is_ascii_digit) && line.as_bytes()[4] == b'-';
+    let mut msg = line;
     if starts_with_date && let Some((_, rest)) = line.split_once(" - ") {
-        return rest.split_once(" - ").map_or(rest, |(_, msg)| msg).trim();
+        msg = rest.split_once(" - ").map_or(rest, |(_, msg)| msg);
     }
-    line.trim()
+    for tag in ["[IMPORT ERR]:", "[IMPORT STD]:"] {
+        msg = msg.trim_start().strip_prefix(tag).unwrap_or(msg);
+    }
+    msg.trim()
 }
 
-/// The first line that says why the last failed import failed, from the end of
-/// the server log: within that import (after the last `Importing with`, if any),
-/// above the last `Unable to import` / `Gradle sync failed` line. For example
-/// `Compose Preview failed for ':app' (variant 'release'): …` (#21) or a Gradle
-/// `What went wrong` / build script error. `None` if no line looks like a cause.
+/// `message` from a `Caused by: some.pkg.SomeException: message` line, or the
+/// line as it is.
+fn exception_message(line: &str) -> &str {
+    let line = line.strip_prefix("Caused by:").map_or(line, str::trim_start);
+    match line.split_once(": ") {
+        Some((class, msg)) if class.contains('.') && !class.contains(char::is_whitespace) => msg,
+        _ => line,
+    }
+}
+
+/// What says why the last failed import failed, from the end of the server log:
+/// within that import (after the last `Importing with`, if any), above the last
+/// `Unable to import` / `Gradle sync failed` line. For example `Compose Preview
+/// failed for ':app' (variant 'release'): …` (#21) or `SDK location not found. …`.
+/// `None` if nothing looks like a cause.
+///
+/// In order of preference: the first Kotlin compiler error (`e: file:…:3:25: …`,
+/// which names the build file and line), the innermost `> ` line of Gradle's
+/// `* What went wrong:` (the cause, with the failures that led to it above it),
+/// the last `Caused by:` (the root of the exception chain), and then the first
+/// line that matches one of a few patterns, the most specific pattern first. Gradle also
+/// prints warnings it continues after, such as `Could not start the FSEvents
+/// stream` from its file watching (#50); these are never the cause.
 fn failure_cause(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let is_marker = |l: &str| l.contains("Unable to import") || l.contains("Gradle sync failed");
     let end = lines.iter().rposition(|l| is_marker(l))?;
     let start = lines[..end].iter().rposition(|l| l.contains("Importing with")).map_or(0, |i| i + 1);
-    const CAUSES: &[&str] = &["failed for", "What went wrong", "Could not ", "Exception:", "e: file:", "error:"];
-    lines[start..end]
+    const NOISE: &[&str] = &["Could not start the FSEvents stream"];
+    let msgs: Vec<&str> = lines[start..end]
         .iter()
         .map(|l| log_message(l))
-        .find(|m| !m.is_empty() && !is_marker(m) && CAUSES.iter().any(|c| m.contains(c)))
-        .map(|m| {
-            let cut = m.char_indices().nth(300).map_or(m.len(), |(i, _)| i);
-            if cut < m.len() { format!("{}…", &m[..cut]) } else { m.to_owned() }
-        })
+        .filter(|m| !m.is_empty() && !is_marker(m) && !NOISE.iter().any(|n| m.contains(n)))
+        .collect();
+
+    let compiler_error = msgs.iter().find(|m| m.starts_with("e: ")).copied();
+    let what_went_wrong = || msgs.iter().rposition(|m| *m == "* What went wrong:").and_then(|i| {
+        let block: Vec<&str> = msgs[i + 1..].iter().copied().take_while(|m| !m.starts_with("* ")).collect();
+        let innermost = block.iter().rev().find(|m| m.starts_with('>')).map(|m| m.trim_start_matches(['>', ' ']));
+        innermost.or(block.first().copied())
+    });
+    let caused_by = || msgs.iter().rev().find(|m| m.starts_with("Caused by:")).map(|m| exception_message(m));
+    const CAUSES: &[&str] = &["failed for", "error:", "Exception:", "Could not "];
+    let pattern = || CAUSES.iter().find_map(|c| msgs.iter().find(|m| m.contains(c))).copied();
+
+    compiler_error.or_else(what_went_wrong).or_else(caused_by).or_else(pattern).map(|m| {
+        let cut = m.char_indices().nth(300).map_or(m.len(), |(i, _)| i);
+        if cut < m.len() { format!("{}…", &m[..cut]) } else { m.to_owned() }
+    })
 }
 
 /// Decode `%XX` escapes (as in a URI query string).
@@ -652,6 +687,55 @@ mod tests {
             failure_cause("e: file:///p/build.gradle.kts:3:1: Unresolved reference: android\nGradle sync failed\n").as_deref(),
             Some("e: file:///p/build.gradle.kts:3:1: Unresolved reference: android")
         );
+    }
+
+    /// Trimmed from a real failed sync (kotlin-lsp 271.2085.0, an Android project
+    /// without `local.properties`): Gradle's file-watching warning comes first.
+    const GRADLE_LOG: &str = "\
+2026-11-24 22:27:17,076 [   2868]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: Caught exception: Could not start the FSEvents stream: /p/klang
+2026-11-24 22:27:17,100 [   2900]   INFO - #c.i.l.s.i.ImportExecutionKt - [IMPORT STD]: > Task :app:generateDebugBuildConfig
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: FAILURE: Build failed with an exception.
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: * What went wrong:
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: Failed to calculate the value of property 'bootClasspath'.
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: > Failed to calculate the value of property 'bootClasspath'.
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]:    > SDK location not found. Define a valid SDK location with an ANDROID_HOME environment variable.
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]:
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: * Try:
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: > Run with --info or --debug option to get more log output.
+2026-11-24 22:27:17,551 [   3343]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: * Exception is:
+2026-11-24 22:27:17,553 [   3345]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: Caused by: org.gradle.api.internal.provider.AbstractProperty$PropertyQueryException: Failed to calculate the value of property 'bootClasspath'.
+2026-11-24 22:27:17,555 [   3347]   WARN - #c.i.l.s.i.ImportExecutionKt - [IMPORT ERR]: Caused by: com.android.builder.errors.EvalIssueException: SDK location not found (from the exception).
+2026-11-24 22:27:17,585 [   3377]   WARN - #c.i.l.s.i.ImportExecutionKt - Unable to import a Gradle project: org.gradle.tooling.BuildActionFailureException: The supplied phased action failed with an exception.
+com.jetbrains.ls.buildtool.api.WorkspaceImportException: Gradle sync failed
+Caused by: com.android.builder.errors.EvalIssueException: SDK location not found (after the marker).
+";
+
+    #[test]
+    fn gradles_own_warnings_are_not_taken_for_the_cause() {
+        // The innermost line of `What went wrong`, not the FSEvents warning before it (#50).
+        assert_eq!(
+            failure_cause(GRADLE_LOG).as_deref(),
+            Some("SDK location not found. Define a valid SDK location with an ANDROID_HOME environment variable.")
+        );
+        // Without `What went wrong`: the last `Caused by:` within the import, without its class.
+        let no_summary: String = GRADLE_LOG.lines().filter(|l| !l.contains("[IMPORT ERR]: ") || l.contains("Caused by") || l.contains("FSEvents")).map(|l| format!("{l}\n")).collect();
+        assert_eq!(failure_cause(&no_summary).as_deref(), Some("SDK location not found (from the exception)."));
+        // A build script that does not compile: the compiler's error, which has the
+        // file and line, rather than the first line of `What went wrong`.
+        let script = "\
+[IMPORT ERR]: Caught exception: Could not start the FSEvents stream: /p
+[IMPORT ERR]: * What went wrong:
+[IMPORT ERR]: Script compilation error:
+[IMPORT ERR]:   Line 3: this is not valid kotlin
+[IMPORT ERR]:                                   ^ Expecting an element
+[IMPORT ERR]: 1 error
+[IMPORT ERR]: e: file:///p/build.gradle.kts:3:25: Expecting an element
+Unable to import a Gradle project
+";
+        assert_eq!(failure_cause(script).as_deref(), Some("e: file:///p/build.gradle.kts:3:25: Expecting an element"));
+        // Only the warning: there is no cause to name.
+        let only_noise: String = GRADLE_LOG.lines().filter(|l| l.contains("FSEvents") || l.contains("sync failed")).map(|l| format!("{l}\n")).collect();
+        assert_eq!(failure_cause(&only_noise), None);
     }
 
     #[test]
