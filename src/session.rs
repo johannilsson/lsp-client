@@ -4,6 +4,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
+/// Why the server refused `initialize`, if its answer is an error rather than a
+/// result: its message and code. A server that has not initialized cannot answer
+/// anything, so this ends the session instead of being shown as an empty answer.
+pub fn initialize_error(resp: &Value) -> Option<String> {
+    let err = resp.get("error").filter(|e| !e.is_null())?;
+    let message = err["message"].as_str().unwrap_or("no message");
+    Some(match err["code"].as_i64() {
+        Some(code) => format!("the language server refused to initialize: {message} (error {code})"),
+        None => format!("the language server refused to initialize: {message}"),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IdleResult {
     /// All $/progress tokens resolved cleanly.
@@ -242,6 +254,9 @@ impl LspSession {
             params["initializationOptions"] = opts.clone();
         }
         let resp = self.request("initialize", params)?;
+        if let Some(err) = initialize_error(&resp) {
+            return Err(err.into());
+        }
         self.notify("initialized", json!({}))?;
         Ok(resp)
     }
@@ -564,6 +579,21 @@ impl LspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_answer_to_initialize_is_a_refusal_with_its_reason() {
+        let refused = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32803, "message": "Ought to always succeed"}});
+        assert_eq!(
+            initialize_error(&refused).as_deref(),
+            Some("the language server refused to initialize: Ought to always succeed (error -32803)")
+        );
+        assert_eq!(
+            initialize_error(&json!({"error": {}})).as_deref(),
+            Some("the language server refused to initialize: no message")
+        );
+        assert_eq!(initialize_error(&json!({"id": 1, "result": {"capabilities": {}}})), None);
+        assert_eq!(initialize_error(&json!({"id": 1, "result": {}, "error": null})), None);
+    }
 
     #[test]
     fn status_is_parsed_from_the_daemon_answer() {

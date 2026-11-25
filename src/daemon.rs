@@ -694,7 +694,29 @@ pub fn run_daemon(
     if let Some(opts) = &options.initialization_options {
         init_params["initializationOptions"] = opts.clone();
     }
-    let init_resp = core.request("initialize", init_params)?;
+    // Without an answer the server has usually exited: say so, with how it ended
+    // (an exit code, or a signal such as SIGKILL from macOS refusing to run it).
+    let init_resp = match core.request("initialize", init_params) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut exited = None;
+            while exited.is_none() && Instant::now() < deadline {
+                exited = child.try_wait().ok().flatten();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(exited.map_or(e, |status| format!("the language server exited ({status}) before it answered initialize").into()));
+        }
+    };
+    // A server that refused `initialize` cannot answer anything: stop it, and fail
+    // the start with its reason rather than serve a server that never initialized.
+    if let Some(err) = crate::session::initialize_error(&init_resp) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err.into());
+    }
 
     // Now the server has said what it is, choose its profile (see `servers`).
     let server_name = init_resp["result"]["serverInfo"]["name"].as_str();

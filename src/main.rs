@@ -613,6 +613,8 @@ fn main() {
                     },
                 ) {
                     eprintln!("daemon error: {e}");
+                    // For `session start`, which does not see this stderr without --verbose.
+                    let _ = std::fs::write(session_file::startup_error_path(root), e.to_string());
                     std::process::exit(1);
                 }
                 return;
@@ -1168,6 +1170,9 @@ fn start_daemon(
     cmd.stdout(Stdio::null());
     cmd.stderr(if verbose { Stdio::inherit() } else { Stdio::null() });
 
+    // A reason left by an earlier daemon that failed is not this one's.
+    let startup_error = session_file::startup_error_path(&effective.root);
+    let _ = std::fs::remove_file(&startup_error);
     let mut child = cmd.spawn()?;
 
     // Poll for the session file to appear — this means the daemon has
@@ -1186,10 +1191,21 @@ fn start_daemon(
         // start) will never become ready: say so now rather than after `max_wait`,
         // which follows `--timeout` and can be minutes.
         if let Some(status) = child.try_wait()? {
-            let mut msg = format!(
-                "the daemon exited ({status}) before it was ready; the language server probably failed to start (check that '{server}' runs, or use '{} --verbose session start' to see its output)",
-                exe.display()
-            );
+            // The daemon's own reason, when it gave one: then there is no need to guess.
+            let mut msg = match std::fs::read_to_string(&startup_error) {
+                Ok(reason) if !reason.trim().is_empty() => {
+                    let _ = std::fs::remove_file(&startup_error);
+                    format!(
+                        "the daemon could not start: {} (use '{} --verbose session start' to see the server's output)",
+                        reason.trim(),
+                        exe.display()
+                    )
+                }
+                _ => format!(
+                    "the daemon exited ({status}) before it was ready; the language server probably failed to start (check that '{server}' runs, or use '{} --verbose session start' to see its output)",
+                    exe.display()
+                ),
+            };
             // Without --verbose the daemon kept the server's stderr: show its end.
             let stderr = session_file::stderr_path(root);
             if let Ok(text) = tail_lines(&stderr.to_string_lossy(), 20)

@@ -93,7 +93,7 @@ lsp-client session status
 lsp-client session stop
 ```
 
-**The server's own output.** Without `--verbose`, the daemon writes the language server's stderr to a file next to its session file (under `~/.cache/lsp-client/sessions/`), keeping about the last 1 MiB. `session status` shows the path as `stderr:` (unless the server announces a log file of its own, as kotlin-lsp does), and `lsp-client session log` prints the end of it. When the server fails at startup, `session start` prints its last lines with the error. The file is removed when the daemon stops normally, and kept when the server died, so `session log` can still show why. With `--verbose` the server's stderr goes to the terminal instead.
+**The server's own output.** Without `--verbose`, the daemon writes the language server's stderr to a file next to its session file (under `~/.cache/lsp-client/sessions/`), keeping about the last 1 MiB. `session status` shows the path as `stderr:` (unless the server announces a log file of its own, as kotlin-lsp does), and `lsp-client session log` prints the end of it. When the server fails at startup, `session start` prints its last lines with the error. It also says how the server failed: it exited before answering `initialize` (with its exit status, or the signal that killed it), or it answered `initialize` with an error, which is quoted. A server that refused `initialize` is stopped, and no daemon is left running. The file is removed when the daemon stops normally, and kept when the server died, so `session log` can still show why. With `--verbose` the server's stderr goes to the terminal instead.
 
 ## Options
 

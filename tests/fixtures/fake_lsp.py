@@ -12,6 +12,9 @@ Environment variables change what it does:
 - FAKE_LSP_INTELLIJ=1: also send kotlin-lsp's `intellij/workspaceImport*`
   notifications, reporting a failed import, as kotlin-lsp would.
 - FAKE_LSP_STDERR: write this line to stderr at startup.
+- FAKE_LSP_INIT_ERROR: answer `initialize` with this error message (code
+  -32803) instead of a result, and keep running, as kotlin-lsp once did.
+- FAKE_LSP_PID_FILE: write the server's process id to this file at startup.
 - FAKE_LSP_HOVER_DELAY: wait this many seconds before answering a hover, to
   stand for a slow query. The answer names the hovered line, so that parallel
   callers can each check they got their own.
@@ -42,6 +45,10 @@ def send(message):
     sys.stdout.buffer.flush()
 
 
+if os.environ.get("FAKE_LSP_PID_FILE"):
+    with open(os.environ["FAKE_LSP_PID_FILE"], "w") as f:
+        f.write(str(os.getpid()))
+
 if os.environ.get("FAKE_LSP_STDERR"):
     sys.stderr.write(os.environ["FAKE_LSP_STDERR"] + "\n")
     sys.stderr.flush()
@@ -53,6 +60,10 @@ while True:
         if os.environ.get("FAKE_LSP_LOG_FILE"):
             send({"jsonrpc": "2.0", "method": "window/logMessage",
                   "params": {"type": 3, "message": "Log file: " + os.environ["FAKE_LSP_LOG_FILE"]}})
+        if os.environ.get("FAKE_LSP_INIT_ERROR"):
+            send({"jsonrpc": "2.0", "id": m["id"],
+                  "error": {"code": -32803, "message": os.environ["FAKE_LSP_INIT_ERROR"]}})
+            continue
         result = {"capabilities": {"hoverProvider": True}}
         if os.environ.get("FAKE_LSP_SERVER_NAME"):
             result["serverInfo"] = {"name": os.environ["FAKE_LSP_SERVER_NAME"], "version": "1"}
