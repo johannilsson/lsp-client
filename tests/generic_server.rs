@@ -416,3 +416,32 @@ fn a_kotlin_lsp_import_failure_names_its_cause_and_an_unused_build_tool() {
     assert!(err.contains("(cause, from the server log: Compose Preview failed for ':app'"), "stderr: {err}");
     assert!(err.contains("--build-tool maven was not used"), "stderr: {err}");
 }
+
+#[test]
+fn a_server_that_refuses_initialize_fails_the_start_and_is_stopped() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("init-error");
+    let pid_file = ws.0.join("server.pid");
+    let out = ws.start_fake(&[], &[
+        ("FAKE_LSP_INIT_ERROR", "Could not start the file watcher"),
+        ("FAKE_LSP_PID_FILE", pid_file.to_str().unwrap()),
+    ]);
+    // Not "ready (indexing complete)": the server never initialized (#51).
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("refused to initialize: Could not start the file watcher (error -32803)"),
+        "stderr: {err}"
+    );
+    assert!(!err.contains("ready"), "stderr: {err}");
+    let status = ws.run(&["session", "status"]);
+    assert!(stderr(&status).contains("not running"), "status: {}", stderr(&status));
+
+    // The server, which would have kept running, was stopped with the daemon.
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let alive = Command::new("kill").args(["-0", pid.trim()]).output().unwrap().status.success();
+    assert!(!alive, "the server (pid {}) is still running", pid.trim());
+}

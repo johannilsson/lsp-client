@@ -74,6 +74,12 @@ pub fn stderr_path(workspace: &str) -> PathBuf {
     sessions_dir().join(format!("{}.stderr", workspace_hash(workspace)))
 }
 
+/// Where the daemon for `workspace` leaves the reason it could not start, for
+/// `session start` to show: without --verbose the daemon's own stderr is not kept.
+pub fn startup_error_path(workspace: &str) -> PathBuf {
+    sessions_dir().join(format!("{}.error", workspace_hash(workspace)))
+}
+
 impl SessionInfo {
     pub fn load(workspace: &str) -> Option<Self> {
         let text = std::fs::read_to_string(session_path(workspace)).ok()?;
