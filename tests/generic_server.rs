@@ -416,3 +416,88 @@ fn a_kotlin_lsp_import_failure_names_its_cause_and_an_unused_build_tool() {
     assert!(err.contains("(cause, from the server log: Compose Preview failed for ':app'"), "stderr: {err}");
     assert!(err.contains("--build-tool maven was not used"), "stderr: {err}");
 }
+
+/// `session start` (without --wait) with the fake server, run in the background.
+fn spawn_start_fake(ws: &Workspace, env: &[(&str, &str)]) -> std::process::Child {
+    let server = fake_server();
+    Command::new(BINARY)
+        .args(["--root", ws.0.to_str().unwrap(), "--timeout", "60s", "--server", server.to_str().unwrap()])
+        .args(["--no-server-stdio-flag", "--language-id", "plain", "session", "start"])
+        .envs(env.iter().copied())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run lsp-client")
+}
+
+/// `session status --json`, once it says "starting" (within 10 s).
+fn wait_until_starting(ws: &Workspace) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = ws.run(&["--json", "session", "status"]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        if v["status"] == "starting" {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "never saw the daemon starting: {v}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn process_alive(pid: u64) -> bool {
+    Command::new("kill").args(["-0", &pid.to_string()]).output().unwrap().status.success()
+}
+
+#[test]
+fn a_daemon_that_is_still_starting_can_be_seen_and_stopped() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("starting-stop");
+    // The server takes a minute to answer `initialize`, as a first kotlin-lsp import can.
+    let start = spawn_start_fake(&ws, &[("FAKE_LSP_INIT_DELAY", "60")]);
+    let status = wait_until_starting(&ws);
+    let (daemon, server) = (status["pid"].as_u64().unwrap(), status["server_pid"].as_u64().unwrap());
+    let text = String::from_utf8_lossy(&ws.run(&["session", "status"]).stdout).into_owned();
+    assert!(text.contains("status:      starting") && text.contains(&format!("pid:         {daemon}")), "{text}");
+
+    // Before #53: "No active daemon session".
+    let stop = ws.run(&["session", "stop"]);
+    assert!(stderr(&stop).contains("still starting") && stderr(&stop).contains("Done."), "stop: {}", stderr(&stop));
+    assert!(!process_alive(daemon), "the daemon (pid {daemon}) is still running");
+    assert!(!process_alive(server), "the server (pid {server}) is still running");
+    let after = ws.run(&["session", "status"]);
+    assert!(stderr(&after).contains("not running"), "status: {}", stderr(&after));
+
+    // The `session start` that was waiting fails rather than waiting out its timeout.
+    let started = Instant::now();
+    let out = start.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_second_start_waits_for_the_daemon_that_is_starting() {
+    if !python3_available() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let ws = Workspace::new("starting-twice");
+    let first = spawn_start_fake(&ws, &[("FAKE_LSP_INIT_DELAY", "3")]);
+    let daemon = wait_until_starting(&ws)["pid"].as_u64().unwrap();
+
+    // Not a second daemon next to the first: the second start waits for it.
+    let second = ws.start_fake(&[], &[]);
+    assert!(second.status.success(), "second start: {}", stderr(&second));
+    let err = stderr(&second);
+    assert!(err.contains("already starting") && err.contains(&format!("(PID {daemon})")), "second start: {err}");
+    let status = ws.run(&["--json", "session", "status"]);
+    let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!((v["status"].as_str(), v["pid"].as_u64()), (Some("running"), Some(daemon)), "{v}");
+    assert!(first.wait_with_output().unwrap().status.success());
+
+    // And once it runs, a start says so instead of starting another.
+    let third = ws.start_fake(&[], &[]);
+    let err = stderr(&third);
+    assert!(err.contains("already running") && err.contains(&format!("(PID {daemon})")), "third start: {err}");
+}
